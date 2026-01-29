@@ -1,0 +1,64 @@
+services:
+  ai-coding-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-coding-agent
+    ports:
+      - "80:80"
+    environment:
+      # FastAPI Configuration
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+      # GitHub App Configuration
+      - GITHUB_APP_ID=${GITHUB_APP_ID}
+      - GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      
+      # OpenAI Configuration
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      
+      # Optional: Yandex GPT Configuration
+      - YANDEX_GPT_API_KEY=${YANDEX_GPT_API_KEY}
+      - YANDEX_GPT_FOLDER_ID=${YANDEX_GPT_FOLDER_ID}
+      
+      # Agent Configuration
+      - MAX_ITERATIONS=${MAX_ITERATIONS:-5}
+      - CODE_AGENT_NAME=${CODE_AGENT_NAME:-AI Code Agent}
+      - REVIEWER_AGENT_NAME=${REVIEWER_AGENT_NAME:-AI Reviewer Agent}
+      
+      # Database Configuration
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/app.db}
+      
+      # Service Configuration
+      - WEBHOOK_TIMEOUT=${WEBHOOK_TIMEOUT:-30}
+      - CI_CHECK_INTERVAL=${CI_CHECK_INTERVAL:-60}
+      - CI_MAX_WAIT_TIME=${CI_MAX_WAIT_TIME:-1800}
+    volumes:
+      # Use named volume for database directory
+      - data:/app/data
+      # Use named volume for logs directory
+      - logs:/app/logs
+      # Mount .env file if it exists
+      - ./.env:/app/.env:ro
+    working_dir: /app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - ai-agent-network
+
+volumes:
+  data:
+  logs:
+
+networks:
+  ai-agent-network:
+    driver: bridge
