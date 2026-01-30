@@ -2,7 +2,7 @@
 
 import logging
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 
@@ -18,6 +18,8 @@ class GitHubAppClient:
     def __init__(self, installation_id: int):
         self.installation_id = installation_id
         self._client: Optional[httpx.AsyncClient] = None
+        self._file_cache = {}  # Кэш для файловых структур
+        self._cache_ttl = timedelta(minutes=5)  # TTL для кэша
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -329,6 +331,77 @@ class GitHubAppClient:
         response.raise_for_status()
         return response.json()["check_runs"]
     
+    async def list_repository_files_recursive(
+        self,
+        owner: str,
+        repo: str,
+        path: str = "",
+        branch: str = None,
+        max_depth: int = 10,
+        max_files: int = 1000,
+        use_cache: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Recursively list all files in repository with caching and limits."""
+        
+        # Проверить кэш
+        cache_key = f"{owner}/{repo}:{branch or 'main'}:{path}"
+        if use_cache and cache_key in self._file_cache:
+            cached_data, cached_time = self._file_cache[cache_key]
+            if datetime.utcnow() - cached_time < self._cache_ttl:
+                logger.info(f"Using cached file list for {cache_key}")
+                return cached_data
+        
+        all_files = []
+        
+        async def _traverse_directory(current_path: str, depth: int = 0):
+            if depth > max_depth:
+                logger.warning(f"Max depth {max_depth} reached for path {current_path}")
+                return
+            
+            if len(all_files) >= max_files:
+                logger.warning(f"Max files limit {max_files} reached")
+                return
+                
+            try:
+                url = f"https://api.github.com/repos/{owner}/{repo}/contents/{current_path}"
+                params = {}
+                if branch:
+                    params["ref"] = branch
+                
+                response = await self._client.get(url, params=params)
+                response.raise_for_status()
+                contents = response.json()
+                
+                if isinstance(contents, dict):
+                    # Single file
+                    all_files.append(contents)
+                else:
+                    # Directory listing
+                    for item in contents:
+                        if len(all_files) >= max_files:
+                            break
+                            
+                        if item["type"] == "file":
+                            all_files.append(item)
+                        elif item["type"] == "dir":
+                            # Пропустить некоторые директории для производительности
+                            if item["name"] in [".git", "node_modules", ".idea", "target", "build"]:
+                                logger.debug(f"Skipping directory {item['path']}")
+                                continue
+                            await _traverse_directory(item["path"], depth + 1)
+                            
+            except Exception as e:
+                logger.error(f"Failed to traverse {current_path}: {e}")
+        
+        await _traverse_directory(path)
+        
+        # Кэшировать результат
+        if use_cache:
+            self._file_cache[cache_key] = (all_files, datetime.utcnow())
+        
+        logger.info(f"Recursively found {len(all_files)} files in {owner}/{repo}")
+        return all_files
+
     async def list_repository_files(
         self,
         owner: str,
@@ -336,16 +409,8 @@ class GitHubAppClient:
         path: str = "",
         branch: str = None
     ) -> List[Dict[str, Any]]:
-        """List files in repository directory."""
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        
-        params = {}
-        if branch:
-            params["ref"] = branch
-        
-        response = await self._client.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
+        """List files in repository directory (now with recursive support)."""
+        return await self.list_repository_files_recursive(owner, repo, path, branch)
     
     async def get_branch_protection(
         self,

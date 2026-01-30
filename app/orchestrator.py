@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 from .database import db_manager, IssueIteration, IterationStatus
@@ -267,7 +267,7 @@ class SDLCOrchestrator:
                     logger.warning(f"Failed to check for existing PRs: {e}")
             
             if pr_number:
-                # Update existing PR
+                # Update existing PR - this is a subsequent iteration
                 pr_title = f"Fix #{issue_number}: {context['issue_title']} (Iteration {context['iteration']})"
                 pr_body = self._generate_pr_description(context, analysis)
                 
@@ -275,11 +275,25 @@ class SDLCOrchestrator:
                     await github.update_pull_request(
                         owner, repo, pr_number, title=pr_title, body=pr_body
                     )
-                    logger.info(f"Updated existing PR #{pr_number}")
+                    logger.info(f"Updated existing PR #{pr_number} for iteration {context['iteration']}")
+                    
+                    # For existing PRs, always return the PR number - don't check for "no changes"
+                    # because we're continuing an existing iteration cycle
+                    return {
+                        "branch_name": branch_name,
+                        "pr_number": pr_number,
+                        "analysis": analysis
+                    }
                 except Exception as e:
                     logger.error(f"Failed to update PR #{pr_number}: {e}")
-                    # Continue anyway, the PR might still be valid
+                    # Continue with the existing PR number anyway
+                    return {
+                        "branch_name": branch_name,
+                        "pr_number": pr_number,
+                        "analysis": analysis
+                    }
             else:
+                # No existing PR - this is the first iteration, create new PR
                 # Check if branch has any changes compared to base before creating new PR
                 try:
                     branch_sha = await github.get_branch_sha(owner, repo, branch_name)
@@ -361,7 +375,21 @@ class SDLCOrchestrator:
                 
                 logger.info(f"Found {len(relevant_classes)} relevant classes and {len(modification_targets)} modification targets")
                 
+                # НОВЫЙ КОД: Поиск целевых файлов для сущностей из issue
+                target_files_context = await self._find_and_load_target_files(
+                    github, owner, repo, repository_analyzer, context
+                )
+                
                 # Build architecture-aware system prompt
+                target_files_section = ""
+                if target_files_context:
+                    target_files_section = f"""
+EXISTING TARGET FILES FOUND:
+{target_files_context}
+
+CRITICAL: These files already exist and should be MODIFIED, not created.
+"""
+                
                 system_prompt = f"""You are an expert software developer analyzing GitHub issues with FULL REPOSITORY CONTEXT.
 
 EXISTING REPOSITORY STRUCTURE:
@@ -375,7 +403,7 @@ SUGGESTED MODIFICATION TARGETS:
 
 ARCHITECTURE PATTERNS DETECTED:
 {', '.join(repository_map.architecture_patterns) if repository_map.architecture_patterns else 'Standard Python project'}
-
+{target_files_section}
 CRITICAL RULES:
 1. **ALWAYS prefer modifying existing classes over creating new ones**
 2. **If a class already exists for the functionality, specify it in files_to_modify, NOT files_to_create**
@@ -508,6 +536,84 @@ Iteration: {context['iteration']}"""
         except Exception as e:
             logger.error(f"Basic issue analysis failed: {e}", exc_info=True)
             return None
+
+    async def _find_and_load_target_files(self, github, owner: str, repo: str, repository_analyzer: RepositoryAnalyzer, context: Dict[str, Any]) -> str:
+        """Найти и загрузить содержимое целевых файлов для issue."""
+        try:
+            # Извлечь потенциальные имена сущностей из issue
+            issue_text = f"{context['issue_title']} {context['issue_body'] or ''}"
+            entity_names = self._extract_entity_names_from_issue(issue_text)
+            
+            target_files_info = []
+            
+            for entity_name in entity_names:
+                logger.info(f"Searching for target files for entity: {entity_name}")
+                
+                # Найти кандидатов
+                candidates = await repository_analyzer.find_target_files_for_entity(
+                    github, owner, repo, entity_name
+                )
+                
+                # Выбрать лучший файл
+                target_file = repository_analyzer.select_best_target_file(candidates, entity_name)
+                
+                if target_file:
+                    # Загрузить содержимое файла
+                    file_content = await self._load_file_content_for_context(
+                        github, owner, repo, target_file
+                    )
+                    
+                    if file_content:
+                        target_files_info.append(f"""
+TARGET FILE: {target_file}
+ENTITY: {entity_name}
+CONTENT PREVIEW:
+```
+{file_content[:1000]}{'...' if len(file_content) > 1000 else ''}
+```
+""")
+                        logger.info(f"Loaded target file content: {target_file}")
+            
+            return "\n".join(target_files_info) if target_files_info else ""
+            
+        except Exception as e:
+            logger.error(f"Failed to find and load target files: {e}")
+            return ""
+
+    def _extract_entity_names_from_issue(self, issue_text: str) -> List[str]:
+        """Извлечь имена сущностей из текста issue."""
+        import re
+        
+        # Паттерны для поиска имён классов/объектов
+        patterns = [
+            r'\b([A-Z][a-zA-Z0-9]*(?:Generator|Manager|Service|Controller|Handler|Processor))\b',
+            r'\b([A-Z][a-zA-Z0-9]*)\s+(?:class|object|trait)',
+            r'`([A-Z][a-zA-Z0-9]*)`',  # Имена в backticks
+            r'"([A-Z][a-zA-Z0-9]*)"',  # Имена в кавычках
+        ]
+        
+        entity_names = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, issue_text)
+            entity_names.update(matches)
+        
+        # Фильтровать слишком короткие или общие имена
+        filtered_names = [name for name in entity_names if len(name) > 2 and name not in ['String', 'Int', 'Boolean']]
+        
+        logger.info(f"Extracted entity names from issue: {filtered_names}")
+        return filtered_names
+
+    async def _load_file_content_for_context(self, github, owner: str, repo: str, file_path: str) -> Optional[str]:
+        """Загрузить содержимое файла для контекста."""
+        try:
+            file_data = await github.get_file_content(owner, repo, file_path, "main")
+            if file_data:
+                import base64
+                content = base64.b64decode(file_data["content"]).decode('utf-8')
+                return content
+        except Exception as e:
+            logger.warning(f"Could not load content for {file_path}: {e}")
+        return None
     
     def _format_relevant_classes(self, relevant_classes) -> str:
         """Format relevant classes for LLM prompt."""
@@ -555,19 +661,23 @@ Iteration: {context['iteration']}"""
         try:
             # Get repository structure
             repo_files = await github.list_repository_files(owner, repo)
+            # Теперь repo_files содержит все файлы рекурсивно
+            
+            # EXISTENCE CHECK: Validate files to create against existing classes
+            validated_analysis = await self._validate_file_operations(analysis, context)
             
             # Process files to modify
-            for file_path in analysis.get("files_to_modify", []):
+            for file_path in validated_analysis.get("files_to_modify", []):
                 success = await self._modify_file(
-                    github, owner, repo, branch_name, file_path, analysis, context
+                    github, owner, repo, branch_name, file_path, validated_analysis, context
                 )
                 if not success:
                     logger.warning(f"Failed to modify {file_path}")
             
-            # Process files to create
-            for file_path in analysis.get("files_to_create", []):
+            # Process files to create (after validation)
+            for file_path in validated_analysis.get("files_to_create", []):
                 success = await self._create_file(
-                    github, owner, repo, branch_name, file_path, analysis, context
+                    github, owner, repo, branch_name, file_path, validated_analysis, context
                 )
                 if not success:
                     logger.warning(f"Failed to create {file_path}")
@@ -577,6 +687,281 @@ Iteration: {context['iteration']}"""
         except Exception as e:
             logger.error(f"Failed to apply code changes: {e}", exc_info=True)
             return False
+    
+    async def _validate_file_operations(self, analysis: Dict, context: Dict[str, Any]) -> Dict:
+        """Validate file operations and enforce existence checks and scope guardrails."""
+        try:
+            logger.info("Validating file operations with existence checks and scope guardrails")
+            
+            # Get repository map from analysis
+            repository_map = analysis.get("repository_map")
+            if not repository_map:
+                logger.warning("No repository map available for existence check")
+                return analysis
+            
+            files_to_create = analysis.get("files_to_create", [])
+            files_to_modify = analysis.get("files_to_modify", [])
+            
+            # SCOPE GUARDRAILS: Analyze task type and restrict operations
+            task_type = self._analyze_task_type(context)
+            scope_restrictions = self._get_scope_restrictions(task_type)
+            
+            validated_create = []
+            validated_modify = list(files_to_modify)  # Start with existing modify list
+            existence_check_results = []
+            scope_check_results = []
+            
+            # Check each file to create for existing classes and scope restrictions
+            for file_path in files_to_create:
+                # SCOPE GUARDRAILS: Check if file creation is allowed for this task type
+                if not scope_restrictions.get("allow_file_creation", True):
+                    scope_check_results.append({
+                        "intended_file": file_path,
+                        "action": "block_create",
+                        "reason": f"Task type '{task_type}' does not allow file creation",
+                        "task_type": task_type
+                    })
+                    logger.info(f"Blocking creation of {file_path} - task type '{task_type}' only allows modifications")
+                    continue
+                
+                # Extract potential class name from file path
+                potential_class_names = self._extract_class_names_from_path(file_path)
+                
+                existing_classes_found = []
+                for class_name in potential_class_names:
+                    # Check if class already exists
+                    existing_class = repository_map.classes.get(class_name)
+                    if existing_class:
+                        existing_classes_found.append(existing_class)
+                        logger.info(f"Found existing class {class_name} in {existing_class.file_path}")
+                    
+                    # Also check fuzzy matches
+                    for existing_name, existing_class in repository_map.classes.items():
+                        if (class_name.lower() in existing_name.lower() or
+                            existing_name.lower() in class_name.lower()):
+                            if existing_class not in existing_classes_found:
+                                existing_classes_found.append(existing_class)
+                                logger.info(f"Found similar existing class {existing_name} in {existing_class.file_path}")
+                
+                if existing_classes_found:
+                    # Move existing files to modify list instead of create
+                    for existing_class in existing_classes_found:
+                        if existing_class.file_path not in validated_modify:
+                            validated_modify.append(existing_class.file_path)
+                            logger.info(f"Moving {existing_class.file_path} from create to modify list")
+                    
+                    existence_check_results.append({
+                        "intended_file": file_path,
+                        "action": "redirect_to_modify",
+                        "existing_classes": [cls.name for cls in existing_classes_found],
+                        "existing_files": [cls.file_path for cls in existing_classes_found]
+                    })
+                else:
+                    # No existing class found, check if creation is allowed
+                    if scope_restrictions.get("allow_file_creation", True):
+                        validated_create.append(file_path)
+                        existence_check_results.append({
+                            "intended_file": file_path,
+                            "action": "allow_create",
+                            "reason": "No existing class found and task type allows creation"
+                        })
+                    else:
+                        scope_check_results.append({
+                            "intended_file": file_path,
+                            "action": "block_create",
+                            "reason": f"Task type '{task_type}' does not allow new file creation",
+                            "task_type": task_type
+                        })
+            
+            # Check for language compatibility
+            project_profile = repository_map.project_profile
+            if project_profile and project_profile.primary_language:
+                language_validated_create = []
+                for file_path in validated_create:
+                    if self._is_language_compatible(file_path, project_profile):
+                        language_validated_create.append(file_path)
+                    else:
+                        logger.warning(f"Blocking creation of {file_path} - incompatible with {project_profile.primary_language} project")
+                        existence_check_results.append({
+                            "intended_file": file_path,
+                            "action": "block_create",
+                            "reason": f"Language incompatible with {project_profile.primary_language} project"
+                        })
+                validated_create = language_validated_create
+            
+            # Update analysis with validated file lists
+            validated_analysis = analysis.copy()
+            validated_analysis["files_to_create"] = validated_create
+            validated_analysis["files_to_modify"] = list(set(validated_modify))  # Remove duplicates
+            validated_analysis["existence_check_results"] = existence_check_results
+            validated_analysis["scope_check_results"] = scope_check_results
+            validated_analysis["task_type"] = task_type
+            validated_analysis["scope_restrictions"] = scope_restrictions
+            
+            # Log validation results
+            logger.info(f"Validation results for task type '{task_type}':")
+            logger.info(f"  - Original files to create: {len(files_to_create)}")
+            logger.info(f"  - Validated files to create: {len(validated_create)}")
+            logger.info(f"  - Files redirected to modify: {len(validated_modify) - len(files_to_modify)}")
+            logger.info(f"  - Files blocked by scope: {len(scope_check_results)}")
+            
+            for result in existence_check_results:
+                logger.info(f"  - {result['intended_file']}: {result['action']} - {result.get('reason', 'See existing_classes')}")
+            
+            for result in scope_check_results:
+                logger.info(f"  - {result['intended_file']}: {result['action']} - {result['reason']}")
+            
+            return validated_analysis
+            
+        except Exception as e:
+            logger.error(f"Failed to validate file operations: {e}", exc_info=True)
+            return analysis  # Return original analysis on error
+    
+    def _extract_class_names_from_path(self, file_path: str) -> List[str]:
+        """Extract potential class names from file path."""
+        try:
+            # Get filename without extension
+            filename = file_path.split('/')[-1]
+            name_without_ext = filename.split('.')[0]
+            
+            # Convert different naming conventions to class names
+            potential_names = []
+            
+            # Direct name
+            potential_names.append(name_without_ext)
+            
+            # PascalCase conversion
+            if '_' in name_without_ext:
+                pascal_case = ''.join(word.capitalize() for word in name_without_ext.split('_'))
+                potential_names.append(pascal_case)
+            
+            # CamelCase to PascalCase
+            if name_without_ext and name_without_ext[0].islower():
+                potential_names.append(name_without_ext.capitalize())
+            
+            return potential_names
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract class names from {file_path}: {e}")
+            return []
+    
+    def _is_language_compatible(self, file_path: str, project_profile) -> bool:
+        """Check if file language is compatible with project."""
+        try:
+            file_ext = file_path.split('.')[-1].lower()
+            primary_lang = project_profile.primary_language.lower()
+            
+            # Language compatibility rules
+            if primary_lang == "scala":
+                # Scala projects should not create Java files
+                return file_ext != "java"
+            elif primary_lang == "java":
+                # Java projects should not create Scala files
+                return file_ext != "scala"
+            elif primary_lang == "python":
+                # Python projects should primarily use Python
+                return file_ext == "py"
+            
+            # Default: allow creation
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to check language compatibility for {file_path}: {e}")
+            return True
+    
+    def _analyze_task_type(self, context: Dict[str, Any]) -> str:
+        """Analyze the task type based on issue title and body."""
+        try:
+            issue_title = context.get("issue_title", "").lower()
+            issue_body = context.get("issue_body", "").lower()
+            combined_text = f"{issue_title} {issue_body}"
+            
+            # Comment-related tasks
+            if any(keyword in combined_text for keyword in [
+                "add comment", "добавить комментар", "comment", "комментар",
+                "document", "документ", "javadoc", "scaladoc"
+            ]):
+                return "add_comments"
+            
+            # Bug fix tasks
+            if any(keyword in combined_text for keyword in [
+                "fix bug", "исправить баг", "bug", "баг", "error", "ошибка",
+                "issue", "проблема", "broken", "сломан"
+            ]):
+                return "fix_bug"
+            
+            # Refactoring tasks
+            if any(keyword in combined_text for keyword in [
+                "refactor", "рефактор", "cleanup", "clean up", "optimize",
+                "improve", "улучшить", "restructure"
+            ]):
+                return "refactor"
+            
+            # New feature tasks
+            if any(keyword in combined_text for keyword in [
+                "add feature", "добавить функци", "new feature", "новая функци",
+                "implement", "реализовать", "create", "создать"
+            ]):
+                return "add_feature"
+            
+            # Test-related tasks
+            if any(keyword in combined_text for keyword in [
+                "test", "тест", "unit test", "integration test"
+            ]):
+                return "add_tests"
+            
+            # Default to general task
+            return "general"
+            
+        except Exception as e:
+            logger.warning(f"Failed to analyze task type: {e}")
+            return "general"
+    
+    def _get_scope_restrictions(self, task_type: str) -> Dict[str, Any]:
+        """Get scope restrictions for a given task type."""
+        restrictions = {
+            "add_comments": {
+                "allow_file_creation": False,
+                "allowed_operations": ["modify_existing"],
+                "description": "Comment tasks should only modify existing files",
+                "max_files_to_modify": 5
+            },
+            "fix_bug": {
+                "allow_file_creation": False,
+                "allowed_operations": ["modify_existing"],
+                "description": "Bug fixes should only modify existing files",
+                "max_files_to_modify": 3
+            },
+            "refactor": {
+                "allow_file_creation": False,
+                "allowed_operations": ["modify_existing", "move_files"],
+                "description": "Refactoring should primarily modify existing files",
+                "max_files_to_modify": 10
+            },
+            "add_feature": {
+                "allow_file_creation": True,
+                "allowed_operations": ["modify_existing", "create_new"],
+                "description": "Feature additions can create new files",
+                "max_files_to_create": 5,
+                "max_files_to_modify": 10
+            },
+            "add_tests": {
+                "allow_file_creation": True,
+                "allowed_operations": ["create_new", "modify_existing"],
+                "description": "Test additions can create new test files",
+                "max_files_to_create": 3,
+                "max_files_to_modify": 5
+            },
+            "general": {
+                "allow_file_creation": True,
+                "allowed_operations": ["modify_existing", "create_new"],
+                "description": "General tasks have no specific restrictions",
+                "max_files_to_create": 3,
+                "max_files_to_modify": 5
+            }
+        }
+        
+        return restrictions.get(task_type, restrictions["general"])
     
     async def _modify_file(
         self,
@@ -590,11 +975,52 @@ Iteration: {context['iteration']}"""
     ) -> bool:
         """Modify an existing file."""
         try:
+            logger.info(f"=== ATTEMPTING TO MODIFY FILE: {file_path} ===")
+            
+            # Получить все файлы репозитория для проверки существования
+            all_files = await github.list_repository_files(owner, repo)
+            existing_files = {file_item["path"] for file_item in all_files}
+            
+            logger.info(f"Repository contains {len(existing_files)} files")
+            logger.info(f"Checking if {file_path} exists in repository...")
+            
+            if file_path not in existing_files:
+                logger.warning(f"❌ FILE NOT FOUND: {file_path}")
+                logger.info(f"Available files matching pattern:")
+                
+                # Поиск похожих файлов для диагностики
+                file_name = file_path.split('/')[-1].split('.')[0]
+                similar_files = [f for f in existing_files if file_name.lower() in f.lower()]
+                for similar in similar_files[:5]:
+                    logger.info(f"  - {similar}")
+                
+                # Проверить ограничения задачи
+                task_type = analysis.get("task_type", "general")
+                
+                if task_type == "add_comments":
+                    logger.error(f"File {file_path} not found and task type '{task_type}' does not allow file creation")
+                    
+                    # Завершить итерацию с сообщением об ошибке
+                    await self._complete_iteration_with_file_not_found_error(
+                        context, file_path, analysis
+                    )
+                    return False
+                else:
+                    logger.info(f"File not found, creating new file: {file_path}")
+                    return await self._create_file(github, owner, repo, branch_name, file_path, analysis, context)
+            
+            # Файл существует, модифицировать его
+            logger.info(f"✅ FILE EXISTS: {file_path}, proceeding with modification")
+            
             # Get current file content
             file_data = await github.get_file_content(owner, repo, file_path, branch_name)
             if not file_data:
-                logger.warning(f"File {file_path} not found, will create instead")
-                return await self._create_file(github, owner, repo, branch_name, file_path, analysis, context)
+                # Попробовать из main ветки
+                file_data = await github.get_file_content(owner, repo, file_path, "main")
+            
+            if not file_data:
+                logger.error(f"Could not retrieve content for {file_path}")
+                return False
             
             import base64
             current_content = base64.b64decode(file_data["content"]).decode()
@@ -1014,8 +1440,23 @@ Please provide the complete file content."""
                     actual_ci_conclusion = iteration.last_ci_conclusion or "unknown"
                     ci_data_source = "stored"
                     logger.info(f"Using stored CI data: {actual_ci_conclusion}")
-                
-                logger.info(f"Final CI status for review: {actual_ci_conclusion} (source: {ci_data_source})")
+                    
+                    # Добавить обработку unhandled CI events:
+                    if actual_ci_conclusion == "unknown":
+                        logger.warning(f"CI status is unknown for PR #{iteration.pr_number} - this will block approval")
+                        
+                        # Проверить, есть ли unhandled CI events в логах
+                        # (это можно сделать через анализ recent webhook events или CI API)
+                        unhandled_events_detected = await self._check_for_unhandled_ci_events(
+                            github, owner, repo, iteration.pr_number
+                        )
+                        
+                        if unhandled_events_detected:
+                            logger.warning(f"Detected unhandled CI events for PR #{iteration.pr_number}")
+                            actual_ci_conclusion = "unknown_unhandled"
+                            ci_data_source += " (unhandled events detected)"
+                    
+                    logger.info(f"Final CI status for review: {actual_ci_conclusion} (source: {ci_data_source})")
                 
                 # Update ci_status_details to reflect the chosen conclusion
                 if ci_status_details:
@@ -1226,9 +1667,28 @@ Please provide the complete file content."""
                 owner, repo, context["pr_number"], comment
             )
             
-            # Determine review event
+            # Determine review event with STRICT CI GATE
             recommendation = review_result.get("overall_assessment", {}).get("recommendation", "")
-            if recommendation == "approve" and context["ci_conclusion"] == "success":
+            ci_conclusion = context.get("ci_conclusion", "unknown")
+            
+            # STRICT CI GATE: NEVER approve when CI fails or unknown
+            if ci_conclusion not in ["success"]:
+                # Force REQUEST_CHANGES when CI fails or unknown, regardless of code quality
+                event = "REQUEST_CHANGES"
+                
+                # Детальное логирование
+                if ci_conclusion == "unknown":
+                    logger.info(f"CI status unknown, forcing REQUEST_CHANGES regardless of recommendation ({recommendation})")
+                    blocking_reason = "CI status is unknown - cannot approve without confirmed successful CI"
+                else:
+                    logger.info(f"CI failed ({ci_conclusion}), forcing REQUEST_CHANGES regardless of recommendation ({recommendation})")
+                    blocking_reason = f"CI failed with status: {ci_conclusion}"
+                
+                # Добавить блокирующую причину в review summary
+                review_summary = review_result.get("overall_assessment", {}).get("summary", "")
+                review_summary += f"\n\n🚫 **BLOCKING**: {blocking_reason}"
+                
+            elif recommendation == "approve" and ci_conclusion == "success":
                 event = "APPROVE"
             elif recommendation == "request_changes":
                 event = "REQUEST_CHANGES"
@@ -1479,40 +1939,43 @@ Please provide the complete file content."""
         ci_conclusion: str,
         ci_data_source: str
     ) -> None:
-        """Start new iteration specifically to fix CI failures."""
+        """Start new iteration specifically to fix CI failures with enhanced context preservation."""
         try:
-            # Create feedback message about CI failure
-            ci_feedback = f"CI failed with status: {ci_conclusion} (source: {ci_data_source}). Please fix the issues that caused CI to fail and ensure all tests pass."
+            logger.info(f"Starting enhanced CI failure iteration for {iteration.repo_full_name}#{iteration.issue_number}")
             
-            # Update iteration with CI failure feedback
+            # Analyze CI failure details
+            ci_failure_analysis = await self._analyze_ci_failure(iteration, ci_conclusion, ci_data_source)
+            
+            # Preserve context from previous iterations
+            iteration_context = await self._build_iteration_context(iteration)
+            
+            # Create enhanced feedback message with CI failure analysis
+            ci_feedback = self._format_ci_failure_feedback(ci_failure_analysis, iteration_context)
+            
+            # Update iteration with enhanced CI failure feedback
             db_manager.update_iteration(
                 iteration.id,
                 last_review_feedback=ci_feedback,
                 status=IterationStatus.RUNNING
             )
             
-            # Post comment about starting new iteration for CI fix
+            # Post detailed comment about CI failure analysis
             if iteration.pr_number:
                 async with await get_github_client(iteration.installation_id) as github:
                     owner, repo = iteration.repo_full_name.split("/")
                     
-                    ci_fix_comment = f"""## 🔄 Starting New Iteration - CI Failed
-
-The code was approved but CI failed with status: **{ci_conclusion}**
-
-**Data Source:** {ci_data_source}
-**Action:** Starting iteration {iteration.current_iteration + 1} to fix CI issues
-
-The agent will analyze the CI failure and attempt to fix the issues that caused the build to fail."""
+                    ci_fix_comment = self._format_ci_failure_comment(
+                        ci_failure_analysis, iteration_context, iteration.current_iteration + 1
+                    )
                     
                     await github.create_issue_comment(
                         owner, repo, iteration.pr_number, ci_fix_comment
                     )
             
-            # Schedule next iteration to fix CI issues
+            # Schedule next iteration with enhanced context
             asyncio.create_task(self._run_code_iteration(iteration))
             
-            logger.info(f"Started new iteration for CI failure fix: {ci_conclusion}")
+            logger.info(f"Started enhanced CI failure iteration with {len(ci_failure_analysis.get('potential_fixes', []))} potential fixes identified")
             
         except Exception as e:
             logger.error(f"Failed to start new iteration for CI failure: {e}", exc_info=True)
@@ -1522,6 +1985,244 @@ The agent will analyze the CI failure and attempt to fix the issues that caused 
                 IterationStatus.FAILED,
                 f"Code approved but CI failed: {ci_conclusion}. Failed to start new iteration: {str(e)}"
             )
+    
+    async def _analyze_ci_failure(self, iteration: IssueIteration, ci_conclusion: str, ci_data_source: str) -> Dict[str, Any]:
+        """Analyze CI failure to understand what went wrong and suggest fixes."""
+        try:
+            logger.info(f"Analyzing CI failure for iteration {iteration.id}")
+            
+            analysis = {
+                "ci_conclusion": ci_conclusion,
+                "ci_data_source": ci_data_source,
+                "potential_fixes": [],
+                "failure_categories": [],
+                "affected_files": []
+            }
+            
+            # Get CI details if available
+            if iteration.pr_number:
+                async with await get_github_client(iteration.installation_id) as github:
+                    owner, repo = iteration.repo_full_name.split("/")
+                    
+                    try:
+                        # Get detailed CI status
+                        ci_details = await github.get_pr_ci_status(owner, repo, iteration.pr_number)
+                        
+                        if ci_details and ci_details.get("failed_checks"):
+                            failed_checks = ci_details["failed_checks"]
+                            analysis["failed_checks"] = failed_checks
+                            
+                            # Categorize failures
+                            for check in failed_checks:
+                                check_lower = check.lower()
+                                if "test" in check_lower:
+                                    analysis["failure_categories"].append("test_failure")
+                                    analysis["potential_fixes"].append("Fix failing tests")
+                                elif "lint" in check_lower or "style" in check_lower:
+                                    analysis["failure_categories"].append("linting_failure")
+                                    analysis["potential_fixes"].append("Fix code style and linting issues")
+                                elif "build" in check_lower or "compile" in check_lower:
+                                    analysis["failure_categories"].append("build_failure")
+                                    analysis["potential_fixes"].append("Fix compilation errors")
+                                elif "security" in check_lower:
+                                    analysis["failure_categories"].append("security_failure")
+                                    analysis["potential_fixes"].append("Fix security vulnerabilities")
+                        
+                        # Get workflow run details if available
+                        if ci_details.get("workflow_runs"):
+                            for run in ci_details["workflow_runs"][:3]:  # Check last 3 runs
+                                if run.get("conclusion") == "failure":
+                                    # Try to get job details
+                                    try:
+                                        jobs = await github.get_workflow_run_jobs(owner, repo, run["id"])
+                                        for job in jobs.get("jobs", []):
+                                            if job.get("conclusion") == "failure":
+                                                job_name = job.get("name", "").lower()
+                                                if "test" in job_name:
+                                                    analysis["failure_categories"].append("test_job_failure")
+                                                elif "build" in job_name:
+                                                    analysis["failure_categories"].append("build_job_failure")
+                                    except Exception as job_e:
+                                        logger.warning(f"Could not get job details: {job_e}")
+                    
+                    except Exception as ci_e:
+                        logger.warning(f"Could not get detailed CI status: {ci_e}")
+            
+            # Add generic fixes based on conclusion
+            if ci_conclusion == "failure":
+                if not analysis["potential_fixes"]:
+                    analysis["potential_fixes"].extend([
+                        "Check and fix any compilation errors",
+                        "Ensure all tests pass",
+                        "Fix any linting or style issues",
+                        "Verify all dependencies are correctly specified"
+                    ])
+            
+            # Remove duplicates
+            analysis["failure_categories"] = list(set(analysis["failure_categories"]))
+            analysis["potential_fixes"] = list(set(analysis["potential_fixes"]))
+            
+            logger.info(f"CI failure analysis complete: {len(analysis['potential_fixes'])} potential fixes identified")
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Failed to analyze CI failure: {e}", exc_info=True)
+            return {
+                "ci_conclusion": ci_conclusion,
+                "ci_data_source": ci_data_source,
+                "potential_fixes": ["Fix CI issues based on build logs"],
+                "failure_categories": ["unknown"],
+                "error": str(e)
+            }
+    
+    async def _build_iteration_context(self, iteration: IssueIteration) -> Dict[str, Any]:
+        """Build context from previous iterations to preserve learning."""
+        try:
+            logger.info(f"Building iteration context for iteration {iteration.id}")
+            
+            context = {
+                "current_iteration": iteration.current_iteration,
+                "max_iterations": iteration.max_iterations,
+                "previous_changes": [],
+                "previous_feedback": [],
+                "files_modified_history": [],
+                "ci_failure_history": []
+            }
+            
+            # Get PR files to understand what was changed
+            if iteration.pr_number:
+                async with await get_github_client(iteration.installation_id) as github:
+                    owner, repo = iteration.repo_full_name.split("/")
+                    
+                    try:
+                        pr_files = await github.get_pull_request_files(owner, repo, iteration.pr_number)
+                        
+                        for file_info in pr_files:
+                            context["files_modified_history"].append({
+                                "filename": file_info["filename"],
+                                "status": file_info["status"],
+                                "additions": file_info["additions"],
+                                "deletions": file_info["deletions"],
+                                "changes": file_info["changes"]
+                            })
+                        
+                        context["total_files_changed"] = len(pr_files)
+                        context["total_additions"] = sum(f["additions"] for f in pr_files)
+                        context["total_deletions"] = sum(f["deletions"] for f in pr_files)
+                        
+                    except Exception as pr_e:
+                        logger.warning(f"Could not get PR files: {pr_e}")
+            
+            # Add previous review feedback if available
+            if iteration.last_review_feedback:
+                context["previous_feedback"].append({
+                    "iteration": iteration.current_iteration,
+                    "feedback": iteration.last_review_feedback,
+                    "timestamp": iteration.updated_at
+                })
+            
+            # Add CI failure history
+            if iteration.last_ci_conclusion and iteration.last_ci_conclusion != "success":
+                context["ci_failure_history"].append({
+                    "iteration": iteration.current_iteration,
+                    "conclusion": iteration.last_ci_conclusion,
+                    "status": iteration.last_ci_status,
+                    "timestamp": iteration.ci_status_updated_at
+                })
+            
+            logger.info(f"Iteration context built: {context['total_files_changed']} files changed, {len(context['previous_feedback'])} feedback items")
+            return context
+            
+        except Exception as e:
+            logger.error(f"Failed to build iteration context: {e}", exc_info=True)
+            return {
+                "current_iteration": iteration.current_iteration,
+                "max_iterations": iteration.max_iterations,
+                "error": str(e)
+            }
+    
+    def _format_ci_failure_feedback(self, ci_analysis: Dict[str, Any], iteration_context: Dict[str, Any]) -> str:
+        """Format enhanced CI failure feedback for the next iteration."""
+        feedback_parts = []
+        
+        # CI failure summary
+        feedback_parts.append(f"CI failed with status: {ci_analysis['ci_conclusion']} (source: {ci_analysis['ci_data_source']})")
+        
+        # Failure categories
+        if ci_analysis.get("failure_categories"):
+            categories = ", ".join(ci_analysis["failure_categories"])
+            feedback_parts.append(f"Failure categories: {categories}")
+        
+        # Specific failed checks
+        if ci_analysis.get("failed_checks"):
+            failed_checks = ", ".join(ci_analysis["failed_checks"])
+            feedback_parts.append(f"Failed checks: {failed_checks}")
+        
+        # Potential fixes
+        if ci_analysis.get("potential_fixes"):
+            fixes = "\n".join(f"- {fix}" for fix in ci_analysis["potential_fixes"])
+            feedback_parts.append(f"Potential fixes:\n{fixes}")
+        
+        # Context from previous iterations
+        if iteration_context.get("files_modified_history"):
+            file_count = len(iteration_context["files_modified_history"])
+            feedback_parts.append(f"Previous changes: {file_count} files modified in this PR")
+            
+            # List modified files
+            modified_files = [f["filename"] for f in iteration_context["files_modified_history"]]
+            if modified_files:
+                files_list = ", ".join(modified_files[:5])  # Show first 5 files
+                if len(modified_files) > 5:
+                    files_list += f" (and {len(modified_files) - 5} more)"
+                feedback_parts.append(f"Modified files: {files_list}")
+        
+        # Previous CI failures
+        if iteration_context.get("ci_failure_history"):
+            feedback_parts.append(f"This is iteration {iteration_context['current_iteration']} of {iteration_context['max_iterations']}")
+            feedback_parts.append("Focus on incremental fixes rather than major rewrites")
+        
+        return ". ".join(feedback_parts) + "."
+    
+    def _format_ci_failure_comment(self, ci_analysis: Dict[str, Any], iteration_context: Dict[str, Any], next_iteration: int) -> str:
+        """Format detailed CI failure comment for PR."""
+        comment = f"""## 🔄 Starting Iteration {next_iteration} - CI Failure Analysis
+
+### 🚨 CI Status: {ci_analysis['ci_conclusion'].upper()}
+**Data Source:** {ci_analysis['ci_data_source']}
+
+### 📊 Failure Analysis:"""
+        
+        if ci_analysis.get("failed_checks"):
+            comment += f"""
+**Failed Checks:** {', '.join(ci_analysis['failed_checks'])}"""
+        
+        if ci_analysis.get("failure_categories"):
+            comment += f"""
+**Categories:** {', '.join(ci_analysis['failure_categories'])}"""
+        
+        if ci_analysis.get("potential_fixes"):
+            comment += f"""
+
+### 🔧 Potential Fixes:
+{chr(10).join(f'- {fix}' for fix in ci_analysis['potential_fixes'])}"""
+        
+        # Add context information
+        if iteration_context.get("files_modified_history"):
+            file_count = len(iteration_context["files_modified_history"])
+            comment += f"""
+
+### 📁 Current PR Context:
+- **Files Modified:** {file_count}
+- **Total Changes:** +{iteration_context.get('total_additions', 0)}/-{iteration_context.get('total_deletions', 0)}"""
+        
+        comment += f"""
+
+### 🎯 Next Steps:
+The agent will analyze the CI failure and make targeted fixes to resolve the issues. This is iteration {next_iteration} of {iteration_context.get('max_iterations', 'unknown')}.
+
+**Strategy:** Focus on incremental fixes based on the failure analysis above."""
+        
+        return comment
 
     async def _complete_iteration(
         self,
@@ -1564,6 +2265,73 @@ Manual intervention may be required to resolve the remaining issues."""
             
         except Exception as e:
             logger.error(f"Failed to complete iteration: {e}", exc_info=True)
+
+
+    async def _check_for_unhandled_ci_events(self, github, owner: str, repo: str, pr_number: int) -> bool:
+        """Проверить наличие необработанных CI событий."""
+        try:
+            # Получить recent workflow runs для PR
+            workflow_runs = await github.get_workflow_runs(owner, repo, pr_number)
+            
+            # Проверить, есть ли runs без соответствующих записей в БД
+            # (это упрощённая проверка - в реальности нужно сравнивать с БД)
+            
+            recent_runs = workflow_runs.get("workflow_runs", [])[:5]  # Последние 5 runs
+            
+            for run in recent_runs:
+                if run.get("status") == "completed" and run.get("conclusion") in ["failure", "success"]:
+                    # Здесь можно добавить проверку, был ли этот run обработан
+                    # Пока просто логируем
+                    logger.debug(f"Found completed workflow run: {run.get('id')} with conclusion: {run.get('conclusion')}")
+            
+            # Возвращаем False пока не реализована полная проверка
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Could not check for unhandled CI events: {e}")
+            return False
+
+    async def _complete_iteration_with_file_not_found_error(self, context: Dict[str, Any], file_path: str, analysis: Dict) -> None:
+        """Завершить итерацию с ошибкой 'файл не найден'."""
+        try:
+            # Собрать информацию о поиске
+            search_results = analysis.get("existence_check_results", [])
+            
+            error_message = f"""File not found: {file_path}
+
+Task type 'add_comments' requires existing files to modify.
+
+Search results:
+"""
+            
+            for result in search_results:
+                error_message += f"- {result.get('intended_file', 'unknown')}: {result.get('action', 'unknown')} - {result.get('reason', 'no reason')}\n"
+            
+            if not search_results:
+                error_message += "- No search results available\n"
+            
+            error_message += """
+Please verify the file path or entity name in the issue description.
+Available files in repository can be found in the repository analysis above.
+"""
+            
+            # Логировать ошибку
+            logger.error(f"File not found error for add_comments task: {file_path}")
+            
+            # Если есть PR, добавить комментарий
+            if context.get("pr_number"):
+                try:
+                    async with await get_github_client(context.get("installation_id")) as github:
+                        owner, repo = context["repo_full_name"].split("/")
+                        await github.create_issue_comment(
+                            owner, repo, context["pr_number"],
+                            f"## ❌ File Not Found Error\n\n{error_message}"
+                        )
+                except Exception as comment_e:
+                    logger.warning(f"Could not post file not found comment: {comment_e}")
+            
+        except Exception as e:
+            logger.error(f"Failed to complete iteration with file not found error: {e}")
 
 
 # Global orchestrator instance
