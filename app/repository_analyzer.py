@@ -791,23 +791,44 @@ class RepositoryAnalyzer:
         return candidates
 
     async def find_target_files_for_entity(self, github_client, owner: str, repo: str, entity_name: str) -> Dict[str, Any]:
-        """Найти целевые файлы для сущности (класса/объекта)."""
+        """Найти целевые файлы для сущности (класса/объекта) с детальным логированием."""
         try:
-            logger.info(f"=== SEARCHING FOR ENTITY: {entity_name} ===")
+            logger.info(f"🔍 === DETAILED ENTITY SEARCH: {entity_name} ===")
+            logger.info(f"Repository: {owner}/{repo}")
+            logger.info(f"Search timestamp: {__import__('datetime').datetime.now().isoformat()}")
             
             # Построить индекс файлов
+            logger.info(f"📁 Building file index...")
             file_index = await self.build_file_index(github_client, owner, repo)
             
-            # Логировать статистику файлов
-            logger.info(f"File index statistics:")
+            # Детальная статистика файлов
+            logger.info(f"📊 DETAILED FILE INDEX STATISTICS:")
+            total_files = len(file_index.get("all", []))
+            logger.info(f"  📄 Total files in repository: {total_files}")
+            
             for lang, files in file_index.items():
-                logger.info(f"  - {lang}: {len(files)} files")
-                if files and lang != "all":
-                    logger.info(f"    Examples: {files[:3]}")
+                if lang != "all":
+                    percentage = (len(files) / total_files * 100) if total_files > 0 else 0
+                    logger.info(f"  🔤 {lang.upper()}: {len(files)} files ({percentage:.1f}%)")
+                    
+                    # Показать примеры файлов для каждого языка
+                    if files:
+                        logger.info(f"    📝 Examples: {files[:5]}")
+                        if len(files) > 5:
+                            logger.info(f"    📝 ... and {len(files) - 5} more")
             
             # Определить основной язык проекта
             primary_language = self.repository_map.project_profile.primary_language
-            logger.info(f"Primary language detected: {primary_language}")
+            logger.info(f"🎯 PRIMARY LANGUAGE DETECTED: {primary_language}")
+            
+            # Логировать проектный профиль
+            if self.repository_map.project_profile:
+                profile = self.repository_map.project_profile
+                logger.info(f"📋 PROJECT PROFILE:")
+                logger.info(f"  - Build system: {profile.build_system}")
+                logger.info(f"  - Project type: {profile.project_type}")
+                logger.info(f"  - Source directories: {profile.source_directories}")
+                logger.info(f"  - Language distribution: {profile.language_files}")
             
             candidates = {
                 "exact_matches": [],
@@ -816,41 +837,122 @@ class RepositoryAnalyzer:
                 "primary_language": primary_language
             }
             
-            # 1. Поиск по имени файла
-            logger.info(f"Searching for files matching '{entity_name}' in {primary_language} files...")
+            # 1. Детальный поиск по имени файла
+            logger.info(f"🔍 PHASE 1: FILENAME PATTERN MATCHING")
+            logger.info(f"  Target entity: '{entity_name}'")
+            logger.info(f"  Searching in: {primary_language} files")
+            logger.info(f"  Search scope: {len(file_index.get(primary_language, []))} files")
+            
             exact_files = self.find_files_by_pattern(file_index, entity_name, primary_language)
             candidates["exact_matches"] = exact_files
-            logger.info(f"Found {len(exact_files)} exact matches: {exact_files}")
             
-            # 2. Поиск по содержимому (только для небольших репозиториев)
+            logger.info(f"  📊 FILENAME SEARCH RESULTS:")
+            logger.info(f"    ✅ Exact matches found: {len(exact_files)}")
+            for i, file_path in enumerate(exact_files):
+                logger.info(f"      {i+1}. {file_path}")
+            
+            if not exact_files:
+                logger.warning(f"    ❌ No exact filename matches for '{entity_name}'")
+                
+                # Показать похожие файлы для диагностики
+                all_lang_files = file_index.get(primary_language, [])
+                similar_files = []
+                entity_lower = entity_name.lower()
+                
+                for file_path in all_lang_files:
+                    filename = file_path.split('/')[-1].split('.')[0].lower()
+                    if entity_lower in filename or filename in entity_lower:
+                        similar_files.append(file_path)
+                
+                if similar_files:
+                    logger.info(f"    🔍 Similar filenames found: {len(similar_files)}")
+                    for file_path in similar_files[:5]:
+                        logger.info(f"      - {file_path}")
+                else:
+                    logger.warning(f"    ❌ No similar filenames found")
+            
+            # 2. Детальный поиск по содержимому
             lang_files = file_index.get(primary_language, [])
+            logger.info(f"🔍 PHASE 2: CONTENT SEARCH")
+            logger.info(f"  Available {primary_language} files: {len(lang_files)}")
+            
             if len(lang_files) < 50:  # Лимит для производительности
-                logger.info(f"Searching in content of {len(lang_files)} {primary_language} files...")
+                logger.info(f"  ✅ Content search enabled (files < 50)")
+                logger.info(f"  🔍 Searching for entity definitions in {len(lang_files)} files...")
+                
                 content_matches = await self._search_entity_in_content(
                     github_client, owner, repo, entity_name, lang_files
                 )
                 candidates["content_matches"] = content_matches
-                logger.info(f"Found {len(content_matches)} content matches: {content_matches}")
+                
+                logger.info(f"  📊 CONTENT SEARCH RESULTS:")
+                logger.info(f"    ✅ Content matches found: {len(content_matches)}")
+                for i, file_path in enumerate(content_matches):
+                    logger.info(f"      {i+1}. {file_path}")
+                
+                if not content_matches:
+                    logger.warning(f"    ❌ No content matches for '{entity_name}'")
             else:
-                logger.info(f"Skipping content search: too many files ({len(lang_files)})")
+                logger.warning(f"  ⚠️ Content search DISABLED: too many files ({len(lang_files)} > 50)")
+                logger.info(f"  💡 Consider using more specific entity names for large repositories")
             
-            # 3. Логирование результатов
-            logger.info(f"=== ENTITY SEARCH RESULTS FOR '{entity_name}' ===")
-            logger.info(f"  - Exact matches: {len(candidates['exact_matches'])}")
-            logger.info(f"  - Content matches: {len(candidates['content_matches'])}")
+            # 3. Детальное логирование результатов поиска
+            logger.info(f"📊 === COMPREHENSIVE SEARCH RESULTS FOR '{entity_name}' ===")
+            total_candidates = len(candidates['exact_matches']) + len(candidates['content_matches'])
+            logger.info(f"  🎯 Total candidates found: {total_candidates}")
+            logger.info(f"  📁 Exact filename matches: {len(candidates['exact_matches'])}")
+            logger.info(f"  📄 Content definition matches: {len(candidates['content_matches'])}")
             
-            # 4. Выбор лучшего файла
-            best_file = self.select_best_target_file(candidates, entity_name)
-            if best_file:
-                logger.info(f"✅ SELECTED TARGET FILE: {best_file}")
+            # 4. Детальный выбор лучшего файла
+            logger.info(f"🎯 PHASE 3: BEST FILE SELECTION")
+            if total_candidates > 0:
+                logger.info(f"  🔍 Analyzing {total_candidates} candidates...")
+                best_file = self.select_best_target_file(candidates, entity_name)
+                
+                if best_file:
+                    logger.info(f"  ✅ FINAL SELECTION: {best_file}")
+                    logger.info(f"  📊 Selection criteria applied:")
+                    logger.info(f"    - Filename exactness")
+                    logger.info(f"    - Language compatibility")
+                    logger.info(f"    - Directory structure")
+                    logger.info(f"    - Naming patterns")
+                else:
+                    logger.error(f"  ❌ SELECTION FAILED: No file selected despite {total_candidates} candidates")
             else:
-                logger.warning(f"❌ NO TARGET FILE FOUND FOR: {entity_name}")
-                logger.warning(f"Available {primary_language} files: {lang_files[:10]}")
+                logger.error(f"  ❌ NO CANDIDATES FOUND")
+                logger.info(f"  🔍 DIAGNOSTIC INFORMATION:")
+                logger.info(f"    - Entity searched: '{entity_name}'")
+                logger.info(f"    - Primary language: {primary_language}")
+                logger.info(f"    - Available {primary_language} files: {len(lang_files)}")
+                
+                # Показать все доступные файлы для диагностики
+                if lang_files:
+                    logger.info(f"    - Sample {primary_language} files:")
+                    for file_path in lang_files[:10]:
+                        filename = file_path.split('/')[-1].split('.')[0]
+                        logger.info(f"      * {filename} ({file_path})")
+                    if len(lang_files) > 10:
+                        logger.info(f"      * ... and {len(lang_files) - 10} more files")
+                else:
+                    logger.error(f"    - ❌ NO {primary_language.upper()} FILES FOUND IN REPOSITORY")
+            
+            # 5. Финальное резюме
+            logger.info(f"🏁 === ENTITY SEARCH COMPLETED: {entity_name} ===")
+            logger.info(f"  Repository: {owner}/{repo}")
+            logger.info(f"  Primary language: {primary_language}")
+            logger.info(f"  Total files analyzed: {total_files}")
+            logger.info(f"  Candidates found: {total_candidates}")
+            logger.info(f"  Final selection: {'✅ ' + best_file if 'best_file' in locals() and best_file else '❌ None'}")
             
             return candidates
             
         except Exception as e:
-            logger.error(f"Failed to find target files for entity {entity_name}: {e}")
+            logger.error(f"💥 ENTITY SEARCH FAILED: {entity_name}")
+            logger.error(f"  Repository: {owner}/{repo}")
+            logger.error(f"  Error: {str(e)}")
+            logger.error(f"  Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"  Traceback: {traceback.format_exc()}")
             return {"exact_matches": [], "partial_matches": [], "content_matches": [], "primary_language": "unknown"}
 
     async def _search_entity_in_content(self, github_client, owner: str, repo: str, entity_name: str, file_paths: List[str]) -> List[str]:
@@ -880,19 +982,104 @@ class RepositoryAnalyzer:
         return matches
 
     def select_best_target_file(self, candidates: Dict[str, Any], entity_name: str) -> Optional[str]:
-        """Выбрать лучший целевой файл из кандидатов."""
-        # Приоритет: точные совпадения > совпадения в содержимом
-        if candidates["exact_matches"]:
-            # Если есть точные совпадения, выбрать первый
-            best_match = candidates["exact_matches"][0]
-            logger.info(f"Selected exact match: {best_match}")
-            return best_match
+        """Выбрать лучший целевой файл из кандидатов с улучшенной приоритизацией."""
+        if not candidates:
+            return None
         
-        if candidates["content_matches"]:
-            # Если есть совпадения в содержимом, выбрать первый
-            best_match = candidates["content_matches"][0]
-            logger.info(f"Selected content match: {best_match}")
-            return best_match
+        logger.info(f"Selecting best target file for entity '{entity_name}' from candidates")
         
-        logger.warning(f"No target file found for entity {entity_name}")
+        # Определить приоритет категорий (от высшего к низшему)
+        priority_order = [
+            "exact_matches",      # Точное совпадение имени файла
+            "content_matches",    # Совпадение в содержимом файла
+            "partial_matches"     # Частичное совпадение
+        ]
+        
+        # Проходим по категориям в порядке приоритета
+        for category in priority_order:
+            if category in candidates and candidates[category]:
+                files_in_category = candidates[category]
+                logger.info(f"Found {len(files_in_category)} files in category '{category}'")
+                
+                if len(files_in_category) == 1:
+                    selected_file = files_in_category[0]
+                    logger.info(f"✅ Selected single file from '{category}': {selected_file}")
+                    return selected_file
+                
+                # Если несколько файлов в категории, применяем дополнительную приоритизацию
+                best_file = self._prioritize_files_within_category(files_in_category, entity_name, category)
+                if best_file:
+                    logger.info(f"✅ Selected best file from '{category}': {best_file}")
+                    return best_file
+        
+        logger.warning(f"❌ No suitable target file found for entity '{entity_name}'")
         return None
+    
+    def _prioritize_files_within_category(self, files: List[str], entity_name: str, category: str) -> Optional[str]:
+        """Приоритизировать файлы внутри категории."""
+        if not files:
+            return None
+        
+        if len(files) == 1:
+            return files[0]
+        
+        logger.info(f"Prioritizing {len(files)} files within category '{category}' for entity '{entity_name}'")
+        
+        # Создать список с оценками для каждого файла
+        scored_files = []
+        
+        for file_path in files:
+            score = 0
+            file_name = file_path.split('/')[-1]
+            name_without_ext = file_name.split('.')[0]
+            file_ext = file_name.split('.')[-1].lower() if '.' in file_name else ""
+            
+            # 1. Приоритет по точности совпадения имени
+            if name_without_ext.lower() == entity_name.lower():
+                score += 100  # Точное совпадение имени файла
+            elif entity_name.lower() in name_without_ext.lower():
+                score += 50   # Частичное совпадение
+            elif name_without_ext.lower() in entity_name.lower():
+                score += 30   # Обратное частичное совпадение
+            
+            # 2. Приоритет по языку (предпочитаем Scala для Scala проектов)
+            if hasattr(self, 'repository_map') and self.repository_map and self.repository_map.project_profile:
+                project_profile = self.repository_map.project_profile
+                if project_profile.primary_language == "scala" and file_ext == "scala":
+                    score += 20
+                elif project_profile.primary_language == "java" and file_ext == "java":
+                    score += 20
+                elif project_profile.primary_language == "python" and file_ext == "py":
+                    score += 20
+            
+            # 3. Приоритет по расположению в директории
+            if "/src/main/" in file_path:
+                score += 15  # Основной код
+            elif "/src/test/" in file_path:
+                score += 5   # Тестовый код (меньший приоритет)
+            
+            # 4. Приоритет по глубине вложенности (предпочитаем менее вложенные)
+            depth = file_path.count('/')
+            score += max(0, 10 - depth)  # Меньше вложенности = больше очков
+            
+            # 5. Бонус за стандартные паттерны именования
+            if any(pattern in name_without_ext for pattern in ["Generator", "Manager", "Service", "Controller"]):
+                score += 10
+            
+            scored_files.append((file_path, score))
+            logger.debug(f"  {file_path}: score={score}")
+        
+        # Сортировать по убыванию оценки
+        scored_files.sort(key=lambda x: x[1], reverse=True)
+        
+        best_file = scored_files[0][0]
+        best_score = scored_files[0][1]
+        
+        logger.info(f"Best file selected: {best_file} (score: {best_score})")
+        
+        # Показать топ-3 для отладки
+        for i, (file_path, score) in enumerate(scored_files[:3]):
+            rank_emoji = ["🥇", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
+            logger.info(f"  {rank_emoji} {file_path} (score: {score})")
+        
+        return best_file

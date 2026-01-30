@@ -384,10 +384,12 @@ class SDLCOrchestrator:
                 target_files_section = ""
                 if target_files_context:
                     target_files_section = f"""
-EXISTING TARGET FILES FOUND:
+🎯 EXISTING TARGET FILES FOUND:
 {target_files_context}
 
-CRITICAL: These files already exist and should be MODIFIED, not created.
+⚠️ CRITICAL INSTRUCTION: These files already exist and MUST be modified, NOT created.
+⚠️ DO NOT create new files with similar names in different languages.
+⚠️ USE EXACT FILE PATHS from the list above in your files_to_modify array.
 """
                 
                 system_prompt = f"""You are an expert software developer analyzing GitHub issues with FULL REPOSITORY CONTEXT.
@@ -622,29 +624,49 @@ CONTENT PREVIEW:
         
         formatted = []
         for cls in relevant_classes[:10]:  # Limit to top 10 to avoid token limits
-            methods_str = ", ".join(cls.methods[:5])  # Show first 5 methods
+            methods_str = ", ".join([method.name for method in cls.methods[:5]])  # Show first 5 methods
             if len(cls.methods) > 5:
                 methods_str += f" (and {len(cls.methods) - 5} more)"
             
             formatted.append(f"- {cls.name} in {cls.file_path}")
-            formatted.append(f"  Purpose: {cls.purpose}")
+            if cls.purpose:
+                formatted.append(f"  Purpose: {cls.purpose}")
             formatted.append(f"  Methods: {methods_str}")
-            formatted.append(f"  Dependencies: {', '.join(cls.dependencies[:3])}")
+            # Убрать строку с dependencies, так как этого поля нет в ClassInfo
             formatted.append("")
         
         return "\n".join(formatted)
     
     def _format_modification_targets(self, modification_targets) -> str:
-        """Format modification targets for LLM prompt."""
+        """Format modification targets for LLM prompt with safe attribute access."""
         if not modification_targets:
             return "No specific modification targets identified."
         
         formatted = []
         for target in modification_targets[:5]:  # Limit to top 5
-            formatted.append(f"- {target.target_type}: {target.name} in {target.file_path}")
-            formatted.append(f"  Reason: {target.reason}")
-            formatted.append(f"  Confidence: {target.confidence}")
-            formatted.append("")
+            try:
+                # Безопасный доступ к атрибутам с fallback значениями
+                target_type = getattr(target, 'target_type', 'Unknown')
+                name = getattr(target, 'name', 'Unknown')
+                file_path = getattr(target, 'file_path', 'Unknown')
+                reason = getattr(target, 'reason', 'No reason provided')
+                confidence = getattr(target, 'confidence', 'Unknown')
+                
+                formatted.append(f"- {target_type}: {name} in {file_path}")
+                formatted.append(f"  Reason: {reason}")
+                formatted.append(f"  Confidence: {confidence}")
+                formatted.append("")
+                
+            except Exception as e:
+                # Fallback для случаев, когда target не имеет ожидаемой структуры
+                logger.warning(f"Failed to format modification target: {e}")
+                if hasattr(target, 'name'):
+                    formatted.append(f"- Target: {target.name}")
+                elif hasattr(target, '__str__'):
+                    formatted.append(f"- Target: {str(target)}")
+                else:
+                    formatted.append(f"- Target: {type(target).__name__}")
+                formatted.append("")
         
         return "\n".join(formatted)
     
@@ -788,6 +810,51 @@ CONTENT PREVIEW:
                             "reason": f"Language incompatible with {project_profile.primary_language} project"
                         })
                 validated_create = language_validated_create
+            
+            # СТРОГАЯ ПРОВЕРКА ЯЗЫКА: дополнительная валидация для операций создания файлов
+            if project_profile:
+                final_validated_create = []
+                for file_path in validated_create:
+                    file_ext = file_path.split('.')[-1].lower() if '.' in file_path else "unknown"
+                    
+                    # Определить язык проекта
+                    project_lang = "Unknown"
+                    if project_profile.is_scala_project:
+                        project_lang = "Scala"
+                    elif project_profile.is_java_project:
+                        project_lang = "Java"
+                    elif project_profile.is_python_project:
+                        project_lang = "Python"
+                    
+                    # Строгая проверка совместимости языка
+                    is_compatible = True
+                    blocking_reason = ""
+                    
+                    if project_profile.is_scala_project and file_ext == "java":
+                        is_compatible = False
+                        blocking_reason = f"Cannot create Java files in Scala project"
+                    elif project_profile.is_java_project and file_ext == "scala":
+                        is_compatible = False
+                        blocking_reason = f"Cannot create Scala files in Java project"
+                    elif project_profile.is_python_project and file_ext not in ["py"]:
+                        is_compatible = False
+                        blocking_reason = f"Cannot create {file_ext.upper()} files in Python project"
+                    
+                    if is_compatible:
+                        final_validated_create.append(file_path)
+                        logger.info(f"✅ LANGUAGE VALIDATION PASSED: {file_path} is compatible with {project_lang} project")
+                    else:
+                        logger.error(f"🚫 STRICT LANGUAGE VALIDATION FAILED: {blocking_reason}")
+                        logger.error(f"   File: {file_path} (extension: {file_ext})")
+                        logger.error(f"   Project: {project_lang} (Scala={project_profile.is_scala_project}, Java={project_profile.is_java_project}, Python={project_profile.is_python_project})")
+                        
+                        existence_check_results.append({
+                            "intended_file": file_path,
+                            "action": "block_create",
+                            "reason": f"STRICT LANGUAGE VALIDATION: {blocking_reason}"
+                        })
+                
+                validated_create = final_validated_create
             
             # Update analysis with validated file lists
             validated_analysis = analysis.copy()
@@ -1133,28 +1200,26 @@ CONTENT PREVIEW:
             if is_modification and repository_map and current_content:
                 logger.info(f"Using architecture-aware modification for {file_path}")
                 
-                # Initialize CodeModifier
-                code_modifier = CodeModifier()
+                # Initialize CodeModifier with repository_map
+                code_modifier = CodeModifier(repository_map)
                 
                 # Find if this file has relevant classes to modify
                 file_classes = [cls for cls in relevant_classes if cls.file_path == file_path]
                 file_targets = [target for target in modification_targets if target.file_path == file_path]
                 
                 if file_classes or file_targets:
-                    # Use intelligent code modification
-                    modified_content = await code_modifier.modify_existing_file(
-                        file_path=file_path,
-                        current_content=current_content,
-                        analysis=analysis,
-                        repository_map=repository_map,
-                        llm_client=self.llm_client
-                    )
-                    
-                    if modified_content:
-                        logger.info(f"Successfully used architecture-aware modification for {file_path}")
-                        return modified_content
-                    else:
-                        logger.warning(f"Architecture-aware modification failed for {file_path}, falling back to basic modification")
+                    # Use intelligent code modification with existing methods
+                    try:
+                        # Generate architecture-aware prompt
+                        requirement = analysis.get('summary', '') + ' ' + analysis.get('technical_approach', '')
+                        arch_prompt = code_modifier.generate_architecture_aware_prompt(requirement, [file_path])
+                        
+                        # For now, fall back to basic LLM modification with architecture context
+                        logger.info(f"Using architecture-aware context for {file_path}")
+                        # We'll use the architecture context in the basic modification below
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to generate architecture context for {file_path}: {e}")
             
             # Build architecture context for LLM prompt
             architecture_context = ""
