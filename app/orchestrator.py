@@ -72,6 +72,11 @@ class SDLCOrchestrator:
                 branch_name=branch_name
             )
             
+            # Lock iteration before starting first iteration
+            if not db_manager.lock_iteration(iteration.id):
+                logger.error(f"Failed to lock iteration {iteration.id} for first run")
+                return None
+            
             # Start first iteration
             await self._run_code_iteration(iteration)
             
@@ -120,6 +125,11 @@ class SDLCOrchestrator:
                 branch_name=branch_name
             )
             
+            # Lock iteration before starting first iteration
+            if not db_manager.lock_iteration(iteration.id):
+                logger.error(f"Failed to lock iteration {iteration.id} for restart")
+                return None
+            
             # Start first iteration
             await self._run_code_iteration(iteration)
             
@@ -130,19 +140,33 @@ class SDLCOrchestrator:
             return None
     
     async def _run_code_iteration(self, iteration: IssueIteration) -> bool:
-        """Run a code generation iteration."""
+        """Run a code generation iteration with proper locking."""
         try:
+            # Verify we have the lock
+            if not db_manager.is_iteration_locked(iteration.id):
+                logger.warning(f"Iteration {iteration.id} is not locked, this should not happen")
+                return False
+            
             logger.info(f"Running code iteration {iteration.current_iteration + 1} for {iteration.repo_full_name}#{iteration.issue_number}")
             
-            # Increment iteration counter
-            iteration = db_manager.increment_iteration(iteration.id)
-            if not iteration:
-                logger.error("Failed to increment iteration")
-                return False
+            # Increment iteration counter with race condition protection
+            try:
+                iteration = db_manager.increment_iteration(iteration.id)
+                if not iteration:
+                    logger.error("Failed to increment iteration")
+                    db_manager.unlock_iteration(iteration.id)
+                    return False
+            except Exception as e:
+                if "already incremented" in str(e).lower():
+                    logger.warning("Iteration already incremented by another process")
+                    db_manager.unlock_iteration(iteration.id)
+                    return False
+                raise
             
             # Check if we've exceeded max iterations
             if iteration.current_iteration >= iteration.max_iterations:
-                await self._complete_iteration(iteration, IterationStatus.FAILED, 
+                db_manager.unlock_iteration(iteration.id)
+                await self._complete_iteration(iteration, IterationStatus.FAILED,
                                              "Maximum iterations reached")
                 return False
             
@@ -165,12 +189,14 @@ class SDLCOrchestrator:
                 result = await self._execute_code_agent(github, context, iteration)
             
             if not result:
+                db_manager.unlock_iteration(iteration.id)
                 await self._complete_iteration(iteration, IterationStatus.FAILED,
                                              "Code generation failed")
                 return False
             
             # Handle case where no PR was created (no changes)
             if result.get("no_changes"):
+                db_manager.unlock_iteration(iteration.id)
                 await self._complete_iteration(iteration, IterationStatus.COMPLETED,
                                              "No changes needed - issue may already be resolved")
                 return True
@@ -183,6 +209,9 @@ class SDLCOrchestrator:
                 status=IterationStatus.WAITING_CI if result.get("pr_number") else IterationStatus.COMPLETED
             )
             
+            # Unlock iteration after successful completion
+            db_manager.unlock_iteration(iteration.id)
+            
             if result.get("pr_number"):
                 logger.info(f"Code iteration completed, waiting for CI. PR: {result.get('pr_number')}")
             else:
@@ -193,6 +222,7 @@ class SDLCOrchestrator:
             
         except Exception as e:
             logger.error(f"Code iteration failed: {e}", exc_info=True)
+            db_manager.unlock_iteration(iteration.id)
             await self._complete_iteration(iteration, IterationStatus.FAILED, str(e))
             return False
     
@@ -1450,10 +1480,23 @@ Please provide the complete file content."""
             return False
     
     async def _run_review_iteration(self, iteration: IssueIteration) -> bool:
-        """Run review iteration with SHA-aware CI status checking."""
+        """Run review iteration with SHA-aware CI status checking and ANTI-DUPLICATION."""
         try:
-            logger.info(f"Running review for {iteration.repo_full_name}#{iteration.issue_number}")
-            logger.info(f"Iteration {iteration.id} current CI status: {iteration.last_ci_status}, conclusion: {iteration.last_ci_conclusion}, SHA: {iteration.pr_head_sha[:8] if iteration.pr_head_sha else 'none'}")
+            # 🚨 CRITICAL: Check if iteration is already being processed to prevent duplication
+            if db_manager.is_iteration_locked(iteration.id):
+                logger.warning(f"🔒 REVIEW DUPLICATION BLOCKED: Iteration {iteration.id} is already being processed")
+                logger.warning(f"   📋 This prevents duplicate review comments")
+                return True
+            
+            # 🚨 CRITICAL: Lock iteration for review processing
+            if not db_manager.lock_iteration(iteration.id):
+                logger.warning(f"🔒 FAILED TO LOCK iteration {iteration.id} for review - another process may be handling it")
+                return False
+            
+            logger.critical(f"🎯 STARTING REVIEW for {iteration.repo_full_name}#{iteration.issue_number}")
+            logger.critical(f"   🔒 Iteration {iteration.id} LOCKED for review processing")
+            logger.critical(f"   📊 Current CI status: {iteration.last_ci_status}, conclusion: {iteration.last_ci_conclusion}")
+            logger.critical(f"   🔗 SHA: {iteration.pr_head_sha[:8] if iteration.pr_head_sha else 'none'}")
             
             owner, repo = iteration.repo_full_name.split("/")
             
@@ -1564,13 +1607,23 @@ Please provide the complete file content."""
                 # Post review to PR
                 await self._post_review_results(github, review_context, review_result)
                 
-                # Decide next action
-                await self._decide_next_action(iteration, review_result, review_context)
+                # Decide next action (may continue iteration with same lock)
+                continue_iteration = await self._decide_next_action(iteration, review_result, review_context)
+                
+                # 🚨 CRITICAL: Only unlock if iteration is NOT continuing
+                if not continue_iteration:
+                    db_manager.unlock_iteration(iteration.id)
+                    logger.critical(f"🔓 REVIEW COMPLETED - Iteration {iteration.id} UNLOCKED (no continuation)")
+                else:
+                    logger.critical(f"🔒 REVIEW COMPLETED - Iteration {iteration.id} LOCK MAINTAINED for continuation")
                 
                 return True
                 
         except Exception as e:
-            logger.error(f"Review iteration failed: {e}", exc_info=True)
+            logger.error(f"❌ Review iteration failed: {e}", exc_info=True)
+            # 🚨 CRITICAL: Always unlock on error
+            db_manager.unlock_iteration(iteration.id)
+            logger.critical(f"🔓 ERROR CLEANUP - Iteration {iteration.id} UNLOCKED")
             await self._complete_iteration(iteration, IterationStatus.FAILED, str(e))
             return False
     
@@ -1632,11 +1685,12 @@ Please provide the complete file content."""
                     number=context["issue_number"]
                 )
                 
-                # Perform comprehensive review with architecture context
+                # Perform comprehensive review with architecture context and CI gate
                 review_result = await reviewer_agent._perform_comprehensive_review(
                     context["pr_data"],
                     issue_data,
-                    pr_files_data
+                    pr_files_data,
+                    context.get("ci_conclusion")
                 )
                 
                 # Add architecture awareness to review if we have repository context
@@ -1705,91 +1759,102 @@ Please provide the complete file content."""
             return None
     
     async def _post_review_results(
-        self, 
-        github, 
-        context: Dict[str, Any], 
+        self,
+        github,
+        context: Dict[str, Any],
         review_result: Dict
     ) -> None:
-        """Post review results to PR."""
+        """Post review results to PR with STRICT CI GATE enforcement."""
         try:
             owner, repo = context["repo_full_name"].split("/")
             
-            # Generate review comment
-            comment = self._format_review_comment(review_result, context)
-            
-            # Post comment
-            await github.create_issue_comment(
-                owner, repo, context["pr_number"], comment
-            )
-            
-            # Determine review event with STRICT CI GATE
-            recommendation = review_result.get("overall_assessment", {}).get("recommendation", "")
+            # STRICT CI GATE: Apply CI gate to review result BEFORE formatting comment
             ci_conclusion = context.get("ci_conclusion", "unknown")
+            original_recommendation = review_result.get("overall_assessment", {}).get("recommendation", "")
             
-            # STRICT CI GATE: NEVER approve when CI fails or unknown
+            # Force recommendation and status when CI is not success
             if ci_conclusion not in ["success"]:
-                # Force REQUEST_CHANGES when CI fails or unknown, regardless of code quality
-                event = "REQUEST_CHANGES"
-                
-                # Детальное логирование
+                # Override the review result to enforce STRICT CI GATE
                 if ci_conclusion == "unknown":
-                    logger.info(f"CI status unknown, forcing REQUEST_CHANGES regardless of recommendation ({recommendation})")
                     blocking_reason = "CI status is unknown - cannot approve without confirmed successful CI"
+                    logger.info(f"CI status unknown, forcing REQUEST_CHANGES regardless of original recommendation ({original_recommendation})")
                 else:
-                    logger.info(f"CI failed ({ci_conclusion}), forcing REQUEST_CHANGES regardless of recommendation ({recommendation})")
                     blocking_reason = f"CI failed with status: {ci_conclusion}"
+                    logger.info(f"CI failed ({ci_conclusion}), forcing REQUEST_CHANGES regardless of original recommendation ({original_recommendation})")
                 
-                # Добавить блокирующую причину в review summary
-                review_summary = review_result.get("overall_assessment", {}).get("summary", "")
-                review_summary += f"\n\n🚫 **BLOCKING**: {blocking_reason}"
+                # Override the overall assessment to reflect CI blocking
+                review_result["overall_assessment"]["recommendation"] = "request_changes"
+                review_result["overall_assessment"]["status"] = "🔄 Changes requested (CI failing)"
                 
-            elif recommendation == "approve" and ci_conclusion == "success":
-                event = "APPROVE"
-            elif recommendation == "request_changes":
+                # Add blocking reason to summary
+                original_summary = review_result.get("overall_assessment", {}).get("summary", "")
+                review_result["overall_assessment"]["summary"] = f"{original_summary}\n\n🚫 **BLOCKING**: {blocking_reason}"
+                
+                # Apply penalty to score when CI fails
+                original_score = review_result.get("overall_assessment", {}).get("score", 0)
+                if original_score > 50:
+                    review_result["overall_assessment"]["score"] = max(30, original_score * 0.6)  # Significant penalty
+                
+                event = "REQUEST_CHANGES"
+            elif original_recommendation == "approve" and ci_conclusion == "success":
+                # 🚨 CRITICAL: NEVER use APPROVE to prevent automatic PR closure
+                event = "COMMENT"
+                logger.critical(f"🚫 BLOCKED APPROVE EVENT: Using COMMENT instead to prevent PR auto-closure")
+                logger.critical(f"   📊 Would have been APPROVE but blocked for safety")
+            elif original_recommendation == "request_changes":
                 event = "REQUEST_CHANGES"
             else:
                 event = "COMMENT"
             
-            # Create review
-            review_summary = review_result.get("overall_assessment", {}).get("summary", "")
+            # Generate review comment with updated review result
+            comment = self._format_review_comment(review_result, context)
             
-            # Ensure review summary is not empty
-            if not review_summary or review_summary.strip() == "":
-                review_summary = "Automated code review completed."
-            
+            # 🚨 CRITICAL FIX: Create ONLY PR review to prevent duplication
             try:
                 await github.create_pull_request_review(
-                    owner, repo, context["pr_number"], review_summary, event
+                    owner, repo, context["pr_number"], comment, event
                 )
+                logger.info(f"✅ Posted SINGLE review to PR #{context['pr_number']} with event: {event}")
+                logger.info(f"🔧 ANTI-DUPLICATION: Only PR review created, no separate comment")
             except Exception as review_e:
                 error_str = str(review_e).lower()
                 if "422" in error_str:
-                    logger.warning(f"Failed to create PR review, possibly due to empty content or duplicate review: {review_e}")
-                    # Continue without failing the entire process
+                    logger.warning(f"❌ Failed to create PR review: {review_e}")
+                    logger.info(f"🔄 FALLBACK: Creating issue comment instead")
+                    # Fallback to comment only if PR review fails
+                    await github.create_issue_comment(
+                        owner, repo, context["pr_number"], comment
+                    )
+                    logger.info(f"✅ Posted fallback comment to PR #{context['pr_number']}")
                 else:
+                    logger.error(f"❌ Unexpected error creating PR review: {review_e}")
                     raise review_e
             
-            logger.info(f"Posted review results to PR #{context['pr_number']}")
+            logger.info(f"Posted review results to PR #{context['pr_number']} with event: {event}")
             
         except Exception as e:
             logger.error(f"Failed to post review results: {e}", exc_info=True)
     
     def _format_review_comment(self, review_result: Dict, context: Dict[str, Any]) -> str:
-        """Format review comment with enhanced SHA-specific logging."""
+        """Format review comment with STRICT CI GATE enforcement."""
         overall = review_result.get("overall_assessment", {})
         
         # Get SHA and data source info for enhanced logging
         ci_details = context.get('ci_status_details', {})
         head_sha = ci_details.get('head_sha', 'unknown')
         data_source = context.get('ci_data_source', 'unknown')
+        ci_conclusion = context.get('ci_conclusion', 'unknown')
+        
+        # Determine the display status based on CI gate enforcement
+        display_status = overall.get('status', 'Review Completed')
         
         comment = f"""## 🤖 AI Code Review - Iteration {context['iteration']}
 
-### {overall.get('status', 'Review Completed')}
+### {display_status}
 
 **Overall Score:** {overall.get('score', 0)}/100
 
-**CI Status:** {context.get('ci_conclusion', 'unknown')} ({'✅' if context.get('ci_conclusion') == 'success' else '❌'})
+**CI Status:** {ci_conclusion} ({'✅' if ci_conclusion == 'success' else '❌'})
 **CI Data Source:** {data_source}
 **Commit SHA:** `{head_sha[:8] if head_sha != 'unknown' else 'unknown'}`
 
@@ -1799,11 +1864,11 @@ Please provide the complete file content."""
         if ci_details and ci_details.get('overall_conclusion') and ci_details.get('overall_conclusion') != 'unknown':
             actual_ci_status = ci_details['overall_conclusion']
             comment = comment.replace(
-                f"**CI Status:** {context.get('ci_conclusion', 'unknown')}",
+                f"**CI Status:** {ci_conclusion}",
                 f"**CI Status:** {actual_ci_status}"
             )
             comment = comment.replace(
-                f"({'✅' if context.get('ci_conclusion') == 'success' else '❌'})",
+                f"({'✅' if ci_conclusion == 'success' else '❌'})",
                 f"({'✅' if actual_ci_status == 'success' else '❌'})"
             )
             
@@ -1850,153 +1915,278 @@ Please provide the complete file content."""
         iteration: IssueIteration,
         review_result: Dict,
         context: Dict[str, Any] = None
-    ) -> None:
-        """Decide what to do next based on review results with DB-first CI status."""
+    ) -> bool:
+        """Decide next action with STRICT CI GATE but CONTINUE in same PR.
+        
+        Returns:
+            bool: True if iteration continues (lock should be maintained), False if completed
+        """
         try:
             overall = review_result.get("overall_assessment", {})
             recommendation = overall.get("recommendation", "")
             
-            # DB-first CI status logic: prioritize webhook data over API data
-            ci_conclusion = None
-            ci_data_source = "unknown"
+            # 🚨 CRITICAL: Get FRESH CI conclusion with strict validation
+            ci_conclusion = await self._get_ci_conclusion_strict(iteration, context)
+            ci_data_source = self._get_ci_data_source(iteration, context)
             
+            # 🔍 DETAILED LOGGING for debugging
+            logger.critical(f"🎯 DECISION ANALYSIS for iteration {iteration.id}:")
+            logger.critical(f"   📊 Recommendation: {recommendation}")
+            logger.critical(f"   🚦 CI Conclusion: {ci_conclusion} (source: {ci_data_source})")
+            logger.critical(f"   📋 Context CI: {context.get('ci_conclusion') if context else 'no context'}")
+            logger.critical(f"   💾 DB CI: {iteration.last_ci_conclusion}")
+            logger.critical(f"   🔄 Iteration: {iteration.current_iteration}/{iteration.max_iterations}")
+            
+            # 🎯 ПРАВИЛО 1: Код хороший + CI зеленый = ЗАВЕРШИТЬ УСПЕШНО
+            if recommendation in ["approve", "approve_with_suggestions"] and ci_conclusion == "success":
+                logger.critical(f"✅ RULE 1 TRIGGERED: Good code + Green CI")
+                logger.critical(f"   📊 Recommendation: {recommendation}")
+                logger.critical(f"   🚦 CI Status: {ci_conclusion}")
+                
+                # 🚨 TRIPLE CHECK: Ensure CI is REALLY success
+                if context and context.get('ci_conclusion') and context.get('ci_conclusion') != 'success':
+                    logger.error(f"🚨 CRITICAL CONFLICT DETECTED:")
+                    logger.error(f"   🎯 Final CI: {ci_conclusion}")
+                    logger.error(f"   📋 Context CI: {context.get('ci_conclusion')}")
+                    logger.error(f"   🔄 FORCING CI FAILURE PATH instead of success")
+                    
+                    # Force CI failure path
+                    if iteration.current_iteration < iteration.max_iterations:
+                        await self._continue_iteration_for_ci_failure(iteration, context.get('ci_conclusion', 'failure'), ci_data_source)
+                        return True  # Iteration continues, maintain lock
+                    else:
+                        await self._complete_iteration(
+                            iteration,
+                            IterationStatus.FAILED,
+                            f"Max iterations reached. Code approved ({recommendation}) but CI conflict detected: final={ci_conclusion}, context={context.get('ci_conclusion')} (source: {ci_data_source})"
+                        )
+                        return False  # Iteration completed, no continuation
+                
+                # All checks passed - complete successfully
+                logger.critical(f"🎉 COMPLETING ITERATION as SUCCESS")
+                await self._complete_iteration(
+                    iteration,
+                    IterationStatus.COMPLETED,
+                    f"Code approved ({recommendation}) and CI passed (source: {ci_data_source})"
+                )
+                return False  # Iteration completed, no continuation
+            
+            # 🎯 ПРАВИЛО 2: Код хороший + CI красный = ПРОДОЛЖИТЬ В ТОМ ЖЕ PR
+            if recommendation in ["approve", "approve_with_suggestions"] and ci_conclusion != "success":
+                logger.critical(f"🔄 RULE 2 TRIGGERED: Good code + Red CI")
+                logger.critical(f"   📊 Recommendation: {recommendation}")
+                logger.critical(f"   🚦 CI Status: {ci_conclusion}")
+                logger.critical(f"   🔄 Current iteration: {iteration.current_iteration}/{iteration.max_iterations}")
+                
+                if iteration.current_iteration < iteration.max_iterations:
+                    logger.critical(f"🔄 CONTINUING iteration in same PR to fix CI")
+                    await self._continue_iteration_for_ci_failure(iteration, ci_conclusion, ci_data_source)
+                    return True  # Iteration continues, maintain lock
+                else:
+                    logger.critical(f"❌ MAX ITERATIONS REACHED - completing as FAILED")
+                    await self._complete_iteration(
+                        iteration,
+                        IterationStatus.FAILED,
+                        f"Max iterations reached. Code approved ({recommendation}) but CI still failing: {ci_conclusion} (source: {ci_data_source})"
+                    )
+                    return False  # Iteration completed, no continuation
+            
+            # 🎯 ПРАВИЛО 3: Код плохой = ПРОДОЛЖИТЬ В ТОМ ЖЕ PR (независимо от CI)
+            if recommendation in ["request_changes", "reject"]:
+                logger.critical(f"🔄 RULE 3 TRIGGERED: Bad code (CI irrelevant)")
+                logger.critical(f"   📊 Recommendation: {recommendation}")
+                logger.critical(f"   🚦 CI Status: {ci_conclusion} (ignored for bad code)")
+                logger.critical(f"   🔄 Current iteration: {iteration.current_iteration}/{iteration.max_iterations}")
+                
+                if iteration.current_iteration < iteration.max_iterations:
+                    logger.critical(f"🔄 CONTINUING iteration in same PR to fix code issues")
+                    await self._continue_iteration_for_code_issues(iteration, review_result)
+                    return True  # Iteration continues, maintain lock
+                else:
+                    logger.critical(f"❌ MAX ITERATIONS REACHED - completing as FAILED")
+                    await self._complete_iteration(
+                        iteration,
+                        IterationStatus.FAILED,
+                        f"Max iterations reached. Code issues remain. Last recommendation: {recommendation}, CI: {ci_conclusion}"
+                    )
+                    return False  # Iteration completed, no continuation
+            
+            # 🚨 UNHANDLED CASE
+            logger.error(f"🚨 UNHANDLED DECISION CASE:")
+            logger.error(f"   📊 Recommendation: {recommendation}")
+            logger.error(f"   🚦 CI Status: {ci_conclusion}")
+            logger.error(f"   🔄 Iteration: {iteration.current_iteration}/{iteration.max_iterations}")
+            logger.error(f"   📋 Context: {context}")
+            
+            await self._complete_iteration(
+                iteration,
+                IterationStatus.FAILED,
+                f"Unhandled decision case: recommendation={recommendation}, CI={ci_conclusion} (source: {ci_data_source})"
+            )
+            return False  # Iteration completed, no continuation
+            
+        except Exception as e:
+            logger.error(f"Failed to decide next action: {e}", exc_info=True)
+            await self._complete_iteration(iteration, IterationStatus.FAILED, str(e))
+            return False  # Iteration completed due to error, no continuation
+
+    async def _get_ci_conclusion_strict(self, iteration: IssueIteration, context: Dict[str, Any] = None) -> str:
+        """Get CI conclusion with STRICT validation and cross-checking."""
+        try:
+            logger.info(f"🔍 STRICT CI STATUS CHECK for iteration {iteration.id}")
+            
+            # Source 1: Context from review (most recent)
+            context_ci = context.get('ci_conclusion') if context else None
+            logger.info(f"   📋 Context CI: {context_ci}")
+            
+            # Source 2: Database webhook data
+            db_ci = iteration.last_ci_conclusion
+            db_source = iteration.ci_status_source
+            db_updated = iteration.ci_status_updated_at
+            logger.info(f"   💾 DB CI: {db_ci} (source: {db_source}, updated: {db_updated})")
+            
+            # Source 3: Fresh API call
+            api_ci = None
+            try:
+                owner, repo = iteration.repo_full_name.split("/")
+                async with await get_github_client(iteration.installation_id) as github:
+                    pr_data = await github.get_pull_request(owner, repo, iteration.pr_number)
+                    current_head_sha = pr_data.get("head", {}).get("sha")
+                    
+                    if current_head_sha:
+                        ci_details = await github.get_pr_ci_status(
+                            owner, repo, iteration.pr_number, expected_sha=current_head_sha
+                        )
+                        api_ci = ci_details.get("overall_conclusion")
+                        logger.info(f"   🌐 API CI: {api_ci} (SHA: {current_head_sha[:8] if current_head_sha else 'unknown'})")
+            except Exception as e:
+                logger.error(f"   ❌ API CI check failed: {e}")
+            
+            # STRICT VALIDATION: Cross-check sources
+            sources = [
+                ("context", context_ci),
+                ("database", db_ci),
+                ("api", api_ci)
+            ]
+            
+            # Filter out None/unknown values
+            valid_sources = [(name, value) for name, value in sources if value and value != "unknown"]
+            
+            if not valid_sources:
+                logger.warning(f"🚨 NO VALID CI DATA FOUND - defaulting to 'unknown'")
+                return "unknown"
+            
+            # Check for conflicts
+            unique_values = set(value for _, value in valid_sources)
+            if len(unique_values) > 1:
+                logger.error(f"🚨 CI STATUS CONFLICT detected:")
+                for name, value in valid_sources:
+                    logger.error(f"     {name}: {value}")
+                
+                # Priority: context > api > database
+                if context_ci and context_ci != "unknown":
+                    logger.warning(f"🎯 Using CONTEXT CI (highest priority): {context_ci}")
+                    return context_ci
+                elif api_ci and api_ci != "unknown":
+                    logger.warning(f"🎯 Using API CI (medium priority): {api_ci}")
+                    return api_ci
+                else:
+                    logger.warning(f"🎯 Using DB CI (lowest priority): {db_ci}")
+                    return db_ci or "unknown"
+            
+            # No conflicts - use the first valid value
+            final_ci = valid_sources[0][1]
+            logger.info(f"✅ CONSISTENT CI STATUS: {final_ci}")
+            return final_ci
+            
+        except Exception as e:
+            logger.error(f"❌ STRICT CI CHECK FAILED: {e}")
+            return "unknown"
+
+    async def _get_ci_conclusion(self, iteration: IssueIteration, context: Dict[str, Any] = None) -> str:
+        """Get CI conclusion using DB-first logic with API fallback."""
+        try:
             # First, check if we have recent webhook data for the current PR head SHA
             if iteration.pr_head_sha and iteration.ci_status_source == "webhook":
                 # Check if webhook data is recent (within 5 minutes)
                 from datetime import datetime, timedelta
                 if (iteration.ci_status_updated_at and
                     datetime.utcnow() - iteration.ci_status_updated_at < timedelta(minutes=5)):
-                    ci_conclusion = iteration.last_ci_conclusion
-                    ci_data_source = "webhook (recent)"
-                    logger.info(f"Using recent webhook CI data for SHA {iteration.pr_head_sha[:8] if iteration.pr_head_sha else 'unknown'}: {ci_conclusion}")
+                    logger.info(f"Using recent webhook CI data for SHA {iteration.pr_head_sha[:8] if iteration.pr_head_sha else 'unknown'}: {iteration.last_ci_conclusion}")
+                    return iteration.last_ci_conclusion or "unknown"
                 else:
                     logger.info(f"Webhook CI data is stale ({iteration.ci_status_updated_at}), will use API fallback")
             
             # Fallback to API data if no recent webhook data
-            if not ci_conclusion or ci_conclusion == "unknown":
-                try:
-                    owner, repo = iteration.repo_full_name.split("/")
-                    async with await get_github_client(iteration.installation_id) as github:
-                        # Get current PR head SHA for validation
-                        pr_data = await github.get_pull_request(owner, repo, iteration.pr_number)
-                        current_head_sha = pr_data.get("head", {}).get("sha")
+            try:
+                owner, repo = iteration.repo_full_name.split("/")
+                async with await get_github_client(iteration.installation_id) as github:
+                    # Get current PR head SHA for validation
+                    pr_data = await github.get_pull_request(owner, repo, iteration.pr_number)
+                    current_head_sha = pr_data.get("head", {}).get("sha")
+                    
+                    if current_head_sha:
+                        logger.info(f"Getting API CI status for current PR head SHA {current_head_sha[:8]}")
+                        ci_details = await github.get_pr_ci_status(
+                            owner, repo, iteration.pr_number, expected_sha=current_head_sha
+                        )
                         
-                        if current_head_sha:
-                            logger.info(f"Getting API CI status for current PR head SHA {current_head_sha[:8]}")
-                            ci_details = await github.get_pr_ci_status(
-                                owner, repo, iteration.pr_number, expected_sha=current_head_sha
-                            )
+                        if ci_details.get("overall_conclusion") and ci_details["overall_conclusion"] != "unknown":
+                            ci_conclusion = ci_details["overall_conclusion"]
+                            logger.info(f"Using API CI data for SHA {current_head_sha[:8]}: {ci_conclusion}")
                             
-                            if ci_details.get("overall_conclusion") and ci_details["overall_conclusion"] != "unknown":
-                                ci_conclusion = ci_details["overall_conclusion"]
-                                ci_data_source = "api (fallback)"
-                                logger.info(f"Using API CI data for SHA {current_head_sha[:8]}: {ci_conclusion}")
-                                
-                                # Update database with API data if it's more recent
-                                if not iteration.pr_head_sha or iteration.pr_head_sha != current_head_sha:
-                                    logger.info(f"Updating iteration with current PR head SHA {current_head_sha[:8]}")
-                                    db_manager.update_ci_status(
-                                        iteration.id,
-                                        ci_status=ci_details.get("overall_status", "unknown"),
-                                        ci_conclusion=ci_conclusion,
-                                        pr_head_sha=current_head_sha,
-                                        source="api"
-                                    )
-                            else:
-                                logger.warning(f"API returned unknown CI status for SHA {current_head_sha[:8]}")
+                            # Update database with API data if it's more recent
+                            if not iteration.pr_head_sha or iteration.pr_head_sha != current_head_sha:
+                                logger.info(f"Updating iteration with current PR head SHA {current_head_sha[:8]}")
+                                db_manager.update_ci_status(
+                                    iteration.id,
+                                    ci_status=ci_details.get("overall_status", "unknown"),
+                                    ci_conclusion=ci_conclusion,
+                                    pr_head_sha=current_head_sha,
+                                    source="api"
+                                )
+                            return ci_conclusion
                         else:
-                            logger.error("Could not get current PR head SHA")
-                            
-                except Exception as e:
-                    logger.error(f"Failed to get API CI status: {e}")
+                            logger.warning(f"API returned unknown CI status for SHA {current_head_sha[:8]}")
+                    else:
+                        logger.error("Could not get current PR head SHA")
+                        
+            except Exception as e:
+                logger.error(f"Failed to get API CI status: {e}")
             
             # Final fallback to stored iteration data
-            if not ci_conclusion or ci_conclusion == "unknown":
-                ci_conclusion = iteration.last_ci_conclusion or "unknown"
-                ci_data_source = "stored (fallback)"
-                logger.info(f"Using stored CI data: {ci_conclusion}")
-            
-            ci_success = ci_conclusion == "success"
-            logger.info(f"Final CI decision for iteration {iteration.id}: {ci_conclusion} (source: {ci_data_source})")
-            
-            # Complete if approved AND CI passed - STRICT CI REQUIREMENT
-            if recommendation in ["approve", "approve_with_suggestions"]:
-                if ci_success:
-                    await self._complete_iteration(
-                        iteration,
-                        IterationStatus.COMPLETED,
-                        f"Code approved ({recommendation}) and CI passed (source: {ci_data_source})"
-                    )
-                else:
-                    # CI failed - continue iteration or fail, NEVER complete as successful
-                    if iteration.current_iteration < iteration.max_iterations:
-                        logger.info(f"Code approved but CI failed ({ci_conclusion}), starting new iteration to fix CI issues")
-                        await self._start_new_iteration_for_ci_failure(iteration, ci_conclusion, ci_data_source)
-                    else:
-                        await self._complete_iteration(
-                            iteration,
-                            IterationStatus.FAILED,
-                            f"Code approved ({recommendation}) but CI failed: {ci_conclusion} (source: {ci_data_source}). Max iterations reached."
-                        )
-                return
-            
-            # Continue iteration if changes requested and under limit
-            if (recommendation in ["request_changes", "reject"] and
-                iteration.current_iteration < iteration.max_iterations):
-                
-                logger.info(f"Review requested changes, starting iteration {iteration.current_iteration + 1}")
-                
-                # Update status to trigger next iteration and store feedback
-                feedback_text = review_result.get("overall_assessment", {}).get("summary", "")
-                if not feedback_text:
-                    # Collect feedback from different sections
-                    feedback_parts = []
-                    if review_result.get("code_quality", {}).get("issues"):
-                        feedback_parts.append("Code Quality Issues: " + "; ".join(review_result["code_quality"]["issues"]))
-                    if review_result.get("requirements_compliance", {}).get("missing_requirements"):
-                        feedback_parts.append("Missing Requirements: " + "; ".join(review_result["requirements_compliance"]["missing_requirements"]))
-                    if review_result.get("security_analysis", {}).get("issues"):
-                        feedback_parts.append("Security Issues: " + "; ".join(review_result["security_analysis"]["issues"]))
-                    feedback_text = ". ".join(feedback_parts) if feedback_parts else "Please address the review comments."
-                
-                db_manager.update_iteration(
-                    iteration.id,
-                    last_review_feedback=feedback_text,
-                    status=IterationStatus.RUNNING
-                )
-                
-                # Schedule next iteration
-                asyncio.create_task(self._run_code_iteration(iteration))
-                return
-            
-            # Fail if max iterations reached
-            if iteration.current_iteration >= iteration.max_iterations:
-                await self._complete_iteration(
-                    iteration,
-                    IterationStatus.FAILED,
-                    f"Maximum iterations ({iteration.max_iterations}) reached. Last recommendation: {recommendation}, CI: {ci_conclusion}"
-                )
-            else:
-                # Handle unhandled cases
-                await self._complete_iteration(
-                    iteration,
-                    IterationStatus.FAILED,
-                    f"Unhandled case: recommendation={recommendation}, CI={ci_conclusion} (source: {ci_data_source})"
-                )
+            ci_conclusion = iteration.last_ci_conclusion or "unknown"
+            logger.info(f"Using stored CI data: {ci_conclusion}")
+            return ci_conclusion
             
         except Exception as e:
-            logger.error(f"Failed to decide next action: {e}", exc_info=True)
-            await self._complete_iteration(iteration, IterationStatus.FAILED, str(e))
+            logger.error(f"Failed to get CI conclusion: {e}")
+            return "unknown"
 
-    async def _start_new_iteration_for_ci_failure(
+    def _get_ci_data_source(self, iteration: IssueIteration, context: Dict[str, Any] = None) -> str:
+        """Get CI data source description."""
+        if iteration.pr_head_sha and iteration.ci_status_source == "webhook":
+            from datetime import datetime, timedelta
+            if (iteration.ci_status_updated_at and
+                datetime.utcnow() - iteration.ci_status_updated_at < timedelta(minutes=5)):
+                return "webhook (recent)"
+            else:
+                return "api (fallback)"
+        return iteration.ci_status_source or "stored (fallback)"
+
+    async def _continue_iteration_for_ci_failure(
         self,
         iteration: IssueIteration,
         ci_conclusion: str,
-        ci_data_source: str
+        ci_data_source: str = "unknown"
     ) -> None:
-        """Start new iteration specifically to fix CI failures with enhanced context preservation."""
+        """Continue iteration in the same PR to fix CI failures."""
         try:
-            logger.info(f"Starting enhanced CI failure iteration for {iteration.repo_full_name}#{iteration.issue_number}")
+            # 🚨 CRITICAL: This method is called from _decide_next_action where iteration is already locked
+            # We should NOT check for lock or try to lock again - just proceed
+            logger.critical(f"🔄 CONTINUING iteration {iteration.id} for CI failure (already locked)")
+            
+            logger.info(f"Continuing iteration for CI failure in {iteration.repo_full_name}#{iteration.issue_number} PR#{iteration.pr_number}")
             
             # Analyze CI failure details
             ci_failure_analysis = await self._analyze_ci_failure(iteration, ci_conclusion, ci_data_source)
@@ -2007,11 +2197,11 @@ Please provide the complete file content."""
             # Create enhanced feedback message with CI failure analysis
             ci_feedback = self._format_ci_failure_feedback(ci_failure_analysis, iteration_context)
             
-            # Update iteration with enhanced CI failure feedback
+            # Update iteration with enhanced CI failure feedback - keep RUNNING status
             db_manager.update_iteration(
                 iteration.id,
                 last_review_feedback=ci_feedback,
-                status=IterationStatus.RUNNING
+                status=IterationStatus.RUNNING  # Continue in same PR
             )
             
             # Post detailed comment about CI failure analysis
@@ -2027,19 +2217,128 @@ Please provide the complete file content."""
                         owner, repo, iteration.pr_number, ci_fix_comment
                     )
             
-            # Schedule next iteration with enhanced context
-            asyncio.create_task(self._run_code_iteration(iteration))
+            # 🚨 CRITICAL: DON'T unlock here - pass the lock to the scheduled iteration
+            # Schedule next iteration instead of running immediately
+            asyncio.create_task(self._schedule_next_iteration(iteration))
             
-            logger.info(f"Started enhanced CI failure iteration with {len(ci_failure_analysis.get('potential_fixes', []))} potential fixes identified")
+            logger.critical(f"🔄 Scheduled next iteration for CI failure with {len(ci_failure_analysis.get('potential_fixes', []))} potential fixes identified (lock maintained)")
             
         except Exception as e:
-            logger.error(f"Failed to start new iteration for CI failure: {e}", exc_info=True)
+            logger.error(f"Failed to continue iteration for CI failure: {e}", exc_info=True)
+            # Unlock iteration on error
+            db_manager.unlock_iteration(iteration.id)
             # Fallback to completing as failed
             await self._complete_iteration(
                 iteration,
                 IterationStatus.FAILED,
-                f"Code approved but CI failed: {ci_conclusion}. Failed to start new iteration: {str(e)}"
+                f"Code approved but CI failed: {ci_conclusion}. Failed to continue iteration: {str(e)}"
             )
+
+    async def _continue_iteration_for_code_issues(
+        self,
+        iteration: IssueIteration,
+        review_result: Dict
+    ) -> None:
+        """Continue iteration in the same PR to fix code issues."""
+        try:
+            # 🚨 CRITICAL: This method is called from _decide_next_action where iteration is already locked
+            # We should NOT check for lock or try to lock again - just proceed
+            logger.critical(f"🔄 CONTINUING iteration {iteration.id} for code issues (already locked)")
+            
+            logger.info(f"Continuing iteration for code issues in {iteration.repo_full_name}#{iteration.issue_number} PR#{iteration.pr_number}")
+            
+            # Extract feedback from review result
+            overall_assessment = review_result.get("overall_assessment", {})
+            feedback_text = overall_assessment.get("summary", "")
+            
+            if not feedback_text:
+                # Collect feedback from different sections
+                feedback_parts = []
+                if review_result.get("code_quality", {}).get("issues"):
+                    issues = review_result["code_quality"]["issues"]
+                    feedback_parts.append("Code Quality Issues: " + "; ".join([issue.get("message", "") for issue in issues]))
+                if review_result.get("requirements_compliance", {}).get("missing_features"):
+                    missing = review_result["requirements_compliance"]["missing_features"]
+                    feedback_parts.append("Missing Requirements: " + "; ".join(missing))
+                if review_result.get("security_analysis", {}).get("security_issues"):
+                    sec_issues = review_result["security_analysis"]["security_issues"]
+                    feedback_parts.append("Security Issues: " + "; ".join([issue.get("issue", "") for issue in sec_issues]))
+                feedback_text = ". ".join(feedback_parts) if feedback_parts else "Please address the review comments."
+            
+            # Update iteration with code issue feedback - keep RUNNING status
+            db_manager.update_iteration(
+                iteration.id,
+                last_review_feedback=feedback_text,
+                status=IterationStatus.RUNNING  # Continue in same PR
+            )
+            
+            # 🚨 CRITICAL: DON'T unlock here - pass the lock to the scheduled iteration
+            # Schedule next iteration instead of running immediately
+            asyncio.create_task(self._schedule_next_iteration(iteration))
+            
+            logger.critical(f"🔄 Scheduled next iteration for code issues (lock maintained)")
+            
+        except Exception as e:
+            logger.error(f"Failed to continue iteration for code issues: {e}", exc_info=True)
+            # Unlock iteration on error
+            db_manager.unlock_iteration(iteration.id)
+            # Fallback to completing as failed
+            await self._complete_iteration(
+                iteration,
+                IterationStatus.FAILED,
+                f"Failed to continue iteration for code issues: {str(e)}"
+            )
+
+    async def _schedule_next_iteration(self, iteration: IssueIteration, delay_seconds: int = 5) -> None:
+        """Schedule next iteration with delay to avoid race conditions."""
+        try:
+            # Delay to avoid race conditions
+            await asyncio.sleep(delay_seconds)
+            
+            # Check that iteration is still active
+            current_iteration = db_manager.get_iteration(iteration.id)
+            if not current_iteration:
+                logger.info(f"Iteration {iteration.id} no longer exists, skipping scheduled iteration")
+                db_manager.unlock_iteration(iteration.id)  # Cleanup lock
+                return
+                
+            if current_iteration.status not in [IterationStatus.RUNNING, IterationStatus.WAITING_CI]:
+                logger.info(f"Iteration {iteration.id} is no longer active (status: {current_iteration.status}), skipping scheduled iteration")
+                db_manager.unlock_iteration(iteration.id)
+                return
+            
+            # Check if we haven't reached max iterations
+            if current_iteration.current_iteration >= current_iteration.max_iterations:
+                logger.info(f"Max iterations reached for {iteration.id}, completing as failed")
+                db_manager.unlock_iteration(iteration.id)
+                await self._complete_iteration(current_iteration, IterationStatus.FAILED, "Max iterations reached")
+                return
+            
+            # 🚨 CRITICAL: We should still have the lock from the continue method
+            # Verify we still have the lock
+            if not db_manager.is_iteration_locked(iteration.id):
+                logger.error(f"🚨 CRITICAL: Lost lock on iteration {iteration.id} during scheduling!")
+                logger.error(f"   This should not happen - lock should be maintained from continue method")
+                return
+            
+            # Run the next iteration (lock is already held)
+            logger.critical(f"🚀 Starting scheduled iteration for {current_iteration.repo_full_name}#{current_iteration.issue_number} (lock maintained)")
+            await self._run_code_iteration(current_iteration)
+            
+        except Exception as e:
+            logger.error(f"Failed to run scheduled iteration: {e}", exc_info=True)
+            db_manager.unlock_iteration(iteration.id)
+            await self._complete_iteration(iteration, IterationStatus.FAILED, f"Scheduled iteration failed: {str(e)}")
+
+    async def _start_new_iteration_for_ci_failure(
+        self,
+        iteration: IssueIteration,
+        ci_conclusion: str,
+        ci_data_source: str
+    ) -> None:
+        """Legacy method - redirects to _continue_iteration_for_ci_failure."""
+        logger.info("Redirecting to _continue_iteration_for_ci_failure for better PR continuity")
+        await self._continue_iteration_for_ci_failure(iteration, ci_conclusion, ci_data_source)
     
     async def _analyze_ci_failure(self, iteration: IssueIteration, ci_conclusion: str, ci_data_source: str) -> Dict[str, Any]:
         """Analyze CI failure to understand what went wrong and suggest fixes."""
@@ -2285,9 +2584,26 @@ The agent will analyze the CI failure and make targeted fixes to resolve the iss
         status: IterationStatus,
         message: str
     ) -> None:
-        """Complete iteration with final status."""
+        """Complete iteration and close PR only when successfully completed - ANTI-DUPLICATION."""
         try:
+            # 🚨 CRITICAL: Check if iteration is already completed to prevent duplication
+            current_iteration = db_manager.get_iteration(iteration.id)
+            if not current_iteration or not current_iteration.is_active:
+                logger.warning(f"🚫 COMPLETION DUPLICATION BLOCKED: Iteration {iteration.id} already completed")
+                logger.warning(f"   📋 Current status: {current_iteration.status if current_iteration else 'not found'}")
+                logger.warning(f"   🔄 This prevents duplicate completion comments")
+                return
+            
+            logger.critical(f"🎯 COMPLETING ITERATION {iteration.id}")
+            logger.critical(f"   📊 Status: {status}")
+            logger.critical(f"   💬 Message: {message}")
+            
+            # Complete iteration in database
             db_manager.complete_iteration(iteration.id, status)
+            
+            # Always unlock iteration when completing
+            db_manager.unlock_iteration(iteration.id)
+            logger.critical(f"🔓 ITERATION {iteration.id} COMPLETED AND UNLOCKED")
             
             # Post final comment to PR if exists
             if iteration.pr_number:
@@ -2295,31 +2611,67 @@ The agent will analyze the CI failure and make targeted fixes to resolve the iss
                     owner, repo = iteration.repo_full_name.split("/")
                     
                     if status == IterationStatus.COMPLETED:
+                        # 🚨 CRITICAL: PR CLOSURE MONITORING - Log any potential closure attempts
+                        logger.critical(f"🚨 PR CLOSURE CHECKPOINT: Would complete PR #{iteration.pr_number} as SUCCESS")
+                        logger.critical(f"   📊 Status: {status}")
+                        logger.critical(f"   💬 Message: {message}")
+                        logger.critical(f"   🔒 PR Closure: DISABLED (manual intervention required)")
+                        
                         final_comment = f"""## ✅ SDLC Cycle Completed Successfully!
 
 The automated development cycle has been completed successfully after {iteration.current_iteration} iteration(s).
 
 **Final Status:** {message}
 
-This PR is ready for human review and merge."""
-                    else:
-                        final_comment = f"""## ❌ SDLC Cycle Failed
+**🚨 PR STATUS:** This PR remains OPEN for manual review and merge.
+**🔧 SAFETY MODE:** Automatic PR closure is DISABLED to prevent incorrect closures.
+**📋 Action Required:** Please manually review and merge this PR if appropriate.
+
+**Completion Details:**
+- Iteration: {iteration.current_iteration}/{iteration.max_iterations}
+- Status: {status}
+- Message: {message}
+- Timestamp: {datetime.utcnow().isoformat()}
+- PR Head SHA: {iteration.pr_head_sha[:8] if iteration.pr_head_sha else 'unknown'}"""
+                        
+                        # Post comment but NEVER close PR
+                        await github.create_issue_comment(
+                            owner, repo, iteration.pr_number, final_comment
+                        )
+                        
+                        logger.critical(f"🚨 WOULD HAVE CLOSED PR #{iteration.pr_number} but closure is DISABLED (debug mode)")
+                        logger.info(f"COMPLETED iteration {iteration.id} - PR #{iteration.pr_number} LEFT OPEN for manual intervention")
+                            
+                    else:  # FAILED
+                        # When failed - DON'T close PR, leave open for manual intervention
+                        final_comment = f"""## ❌ SDLC Cycle Failed - Manual Intervention Required
 
 The automated development cycle could not be completed successfully.
 
 **Reason:** {message}
 **Iterations:** {iteration.current_iteration}/{iteration.max_iterations}
 
-Manual intervention may be required to resolve the remaining issues."""
-                    
-                    await github.create_issue_comment(
-                        owner, repo, iteration.pr_number, final_comment
-                    )
+**PR Status:** This PR remains OPEN for manual review and fixes.
+**IMPORTANT:** The agent will NOT make further automatic changes to this PR.
+Manual intervention is required to resolve the remaining issues."""
+                        
+                        # Post comment but DON'T close PR - let humans fix it
+                        await github.create_issue_comment(
+                            owner, repo, iteration.pr_number, final_comment
+                        )
+                        
+                        logger.info(f"Posted failure comment to PR #{iteration.pr_number} but LEFT IT OPEN for manual intervention")
             
             logger.info(f"Completed iteration {iteration.id} with status {status}: {message}")
+            if status == IterationStatus.FAILED:
+                logger.info(f"PR #{iteration.pr_number} left OPEN for manual intervention")
+            elif status == IterationStatus.COMPLETED:
+                logger.info(f"🚨 DEBUG: PR #{iteration.pr_number} completion processed - PR LEFT OPEN (closure disabled)")
             
         except Exception as e:
             logger.error(f"Failed to complete iteration: {e}", exc_info=True)
+            # Always unlock on error
+            db_manager.unlock_iteration(iteration.id)
 
 
     async def _check_for_unhandled_ci_events(self, github, owner: str, repo: str, pr_number: int) -> bool:

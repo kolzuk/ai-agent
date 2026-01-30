@@ -60,9 +60,9 @@ class ReviewerAgent:
             return {"status": "error", "message": str(e)}
 
     async def _perform_comprehensive_review(
-        self, pr, issue, pr_files: List[Dict]
+        self, pr, issue, pr_files: List[Dict], ci_conclusion: str = None
     ) -> Dict[str, any]:
-        """Perform a comprehensive review of the pull request."""
+        """Perform a comprehensive review of the pull request with CI gate enforcement."""
         try:
             # Analyze code quality
             code_quality_result = await self._analyze_code_quality(pr_files)
@@ -75,13 +75,14 @@ class ReviewerAgent:
             # Analyze security and best practices
             security_result = await self._analyze_security_and_practices(pr_files)
             
-            # Generate overall assessment
+            # Generate overall assessment with CI gate enforcement
             overall_assessment = await self._generate_overall_assessment(
                 code_quality_result,
                 requirements_result,
                 security_result,
                 pr,
-                issue
+                issue,
+                ci_conclusion
             )
             
             return {
@@ -300,9 +301,10 @@ Provide your security and best practices analysis."""
         requirements: Dict,
         security: Dict,
         pr,
-        issue
+        issue,
+        ci_conclusion: str = None
     ) -> Dict[str, any]:
-        """Generate an overall assessment and recommendation."""
+        """Generate an overall assessment and recommendation with CI gate enforcement."""
         try:
             # Calculate weighted score
             code_score = code_quality.get("score", 0)
@@ -312,19 +314,37 @@ Provide your security and best practices analysis."""
             # Weighted average: code quality 40%, requirements 40%, security 20%
             overall_score = (code_score * 0.4 + req_score * 0.4 + sec_score * 0.2)
             
-            # Determine recommendation
+            # Determine base recommendation (before CI gate)
             if overall_score >= 85:
-                recommendation = "approve"
-                status = "✅ Ready to merge"
+                base_recommendation = "approve"
+                base_status = "✅ Ready to merge"
             elif overall_score >= 70:
-                recommendation = "approve_with_suggestions"
-                status = "⚠️ Approve with minor suggestions"
+                base_recommendation = "approve_with_suggestions"
+                base_status = "⚠️ Approve with minor suggestions"
             elif overall_score >= 50:
-                recommendation = "request_changes"
-                status = "🔄 Changes requested"
+                base_recommendation = "request_changes"
+                base_status = "🔄 Changes requested"
             else:
-                recommendation = "reject"
-                status = "❌ Significant issues found"
+                base_recommendation = "reject"
+                base_status = "❌ Significant issues found"
+
+            # STRICT CI GATE: Override recommendation if CI is not success
+            final_recommendation = base_recommendation
+            final_status = base_status
+            ci_blocking = False
+            
+            if ci_conclusion and ci_conclusion != "success":
+                # CI failed or unknown - force request_changes regardless of code quality
+                if base_recommendation in ["approve", "approve_with_suggestions"]:
+                    final_recommendation = "request_changes"
+                    final_status = "🔄 Changes requested (CI failing)"
+                    ci_blocking = True
+                    
+                    # Apply penalty to score when CI blocks approval
+                    if overall_score > 50:
+                        overall_score = max(30, overall_score * 0.6)  # Significant penalty
+                    
+                    logger.info(f"CI gate blocked approval: {base_recommendation} -> {final_recommendation} (CI: {ci_conclusion})")
 
             # Count critical issues
             critical_issues = 0
@@ -332,17 +352,28 @@ Provide your security and best practices analysis."""
                 issues = analysis.get("issues", []) + analysis.get("security_issues", [])
                 critical_issues += len([i for i in issues if i.get("severity") == "high" or i.get("type") == "error"])
 
+            # Build summary with CI information
+            summary = f"Overall score: {overall_score:.1f}/100. {final_status}"
+            if ci_blocking:
+                if ci_conclusion == "unknown":
+                    summary += f"\n\n🚫 **CI GATE**: Cannot approve - CI status is unknown"
+                else:
+                    summary += f"\n\n🚫 **CI GATE**: Cannot approve - CI failed with status: {ci_conclusion}"
+
             return {
                 "score": round(overall_score, 1),
-                "recommendation": recommendation,
-                "status": status,
+                "recommendation": final_recommendation,
+                "status": final_status,
                 "critical_issues_count": critical_issues,
-                "summary": f"Overall score: {overall_score:.1f}/100. {status}",
+                "summary": summary,
                 "breakdown": {
                     "code_quality": code_score,
                     "requirements_compliance": req_score,
                     "security_and_practices": sec_score
-                }
+                },
+                "ci_gate_applied": ci_blocking,
+                "original_recommendation": base_recommendation if ci_blocking else final_recommendation,
+                "ci_conclusion": ci_conclusion
             }
 
         except Exception as e:

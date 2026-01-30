@@ -75,6 +75,10 @@ class IssueIteration(Base):
     
     # Flags
     is_active = Column(Boolean, default=True)
+    
+    # Processing lock to prevent race conditions
+    is_processing = Column(Boolean, default=False)
+    processing_started_at = Column(DateTime, nullable=True)
 
 
 async def init_db() -> None:
@@ -113,6 +117,14 @@ async def init_db() -> None:
         if 'ci_status_updated_at' not in columns:
             logger.info("Adding ci_status_updated_at column to issue_iterations table")
             cursor.execute("ALTER TABLE issue_iterations ADD COLUMN ci_status_updated_at DATETIME")
+            
+        if 'is_processing' not in columns:
+            logger.info("Adding is_processing column to issue_iterations table")
+            cursor.execute("ALTER TABLE issue_iterations ADD COLUMN is_processing BOOLEAN DEFAULT 0")
+            
+        if 'processing_started_at' not in columns:
+            logger.info("Adding processing_started_at column to issue_iterations table")
+            cursor.execute("ALTER TABLE issue_iterations ADD COLUMN processing_started_at DATETIME")
         
         conn.commit()
         conn.close()
@@ -330,6 +342,88 @@ class DatabaseManager:
             ).first()
             
             return iteration
+    
+    def lock_iteration(self, iteration_id: int) -> bool:
+        """Lock iteration for processing. Returns True if successfully locked."""
+        with self.get_session() as db:
+            iteration = db.query(IssueIteration).filter(
+                IssueIteration.id == iteration_id
+            ).first()
+            
+            if not iteration:
+                return False
+            
+            # Check if already locked
+            if iteration.is_processing:
+                # Check if lock is stale (older than 10 minutes)
+                if iteration.processing_started_at:
+                    from datetime import timedelta
+                    stale_threshold = datetime.utcnow() - timedelta(minutes=10)
+                    if iteration.processing_started_at < stale_threshold:
+                        # Lock is stale, force unlock and relock
+                        iteration.is_processing = False
+                        iteration.processing_started_at = None
+                    else:
+                        # Lock is active
+                        return False
+                else:
+                    # No timestamp, assume stale
+                    iteration.is_processing = False
+            
+            # Lock the iteration
+            iteration.is_processing = True
+            iteration.processing_started_at = datetime.utcnow()
+            iteration.updated_at = datetime.utcnow()
+            
+            db.commit()
+            return True
+    
+    def unlock_iteration(self, iteration_id: int) -> None:
+        """Unlock iteration after processing."""
+        with self.get_session() as db:
+            iteration = db.query(IssueIteration).filter(
+                IssueIteration.id == iteration_id
+            ).first()
+            
+            if iteration:
+                iteration.is_processing = False
+                iteration.processing_started_at = None
+                iteration.updated_at = datetime.utcnow()
+                db.commit()
+    
+    def is_iteration_locked(self, iteration_id: int) -> bool:
+        """Check if iteration is currently locked."""
+        with self.get_session() as db:
+            iteration = db.query(IssueIteration).filter(
+                IssueIteration.id == iteration_id
+            ).first()
+            
+            if not iteration:
+                return False
+            
+            if not iteration.is_processing:
+                return False
+            
+            # Check if lock is stale
+            if iteration.processing_started_at:
+                from datetime import timedelta
+                stale_threshold = datetime.utcnow() - timedelta(minutes=10)
+                if iteration.processing_started_at < stale_threshold:
+                    # Lock is stale, auto-unlock
+                    iteration.is_processing = False
+                    iteration.processing_started_at = None
+                    iteration.updated_at = datetime.utcnow()
+                    db.commit()
+                    return False
+            
+            return True
+    
+    def get_iteration(self, iteration_id: int) -> Optional[IssueIteration]:
+        """Get iteration by ID."""
+        with self.get_session() as db:
+            return db.query(IssueIteration).filter(
+                IssueIteration.id == iteration_id
+            ).first()
 
 
 # Global database manager instance

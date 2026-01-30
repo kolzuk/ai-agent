@@ -210,6 +210,21 @@ class GitHubAppClient:
         response.raise_for_status()
         return response.json()
     
+    async def close_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int
+    ) -> Dict[str, Any]:
+        """Close a pull request."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+        
+        data = {"state": "closed"}
+        
+        response = await self._client.patch(url, json=data)
+        response.raise_for_status()
+        return response.json()
+    
     async def create_issue_comment(
         self,
         owner: str,
