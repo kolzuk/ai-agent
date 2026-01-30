@@ -11,9 +11,8 @@ from .github_app.auth import github_app_auth
 from .config import settings
 from .repository_analyzer import RepositoryAnalyzer
 from .code_modifier import CodeModifier
-from ai_coding_agent.code_agent import CodeAgent
-from ai_coding_agent.reviewer_agent import ReviewerAgent
-from ai_coding_agent.llm_client import LLMClient
+from .llm_client import LLMClient
+from .reviewer import ReviewerAgent
 
 logger = logging.getLogger(__name__)
 
@@ -1598,19 +1597,10 @@ Please provide the complete file content."""
                     logger.warning(f"Repository analysis failed for review: {e}, proceeding without architecture context")
                 
                 # Create GitHub client wrapper for old agent
-                from ai_coding_agent.github_client import GitHubClient
+                from .github_client import GitHubAppClient as GitHubClient
                 
-                # Get installation token for this repo
-                installation_token = await github_app_auth.get_installation_token(
-                    context.get("installation_id")
-                )
-                
-                # Create old-style GitHub client
-                github_client = GitHubClient(
-                    github_token=installation_token,
-                    repo_owner=owner,
-                    repo_name=repo
-                )
+                # Create GitHub client using installation_id (our new unified approach)
+                github_client = GitHubClient(context.get("installation_id"))
                 
                 # Create reviewer agent with dependencies
                 reviewer_agent = ReviewerAgent(github_client, self.llm_client)

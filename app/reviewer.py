@@ -4,10 +4,14 @@ import asyncio
 import json
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from .github_client import GitHubClient
 from .llm_client import LLMClient
+
+if TYPE_CHECKING:
+    from .github_client import GitHubAppClient as GitHubClient
+else:
+    GitHubClient = "GitHubAppClient"
 
 logger = logging.getLogger(__name__)
 

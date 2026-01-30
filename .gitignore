@@ -1,0 +1,6 @@
+# local sqlite db
+data/app.db
+*.db
+
+*.env
+*.pem
